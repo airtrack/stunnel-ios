@@ -1,20 +1,22 @@
-use smoltcp::iface::{Config, Interface, SocketSet};
+use bytes::{Bytes, BytesMut};
+use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer};
 use smoltcp::socket::AnySocket;
 use smoltcp::time::Instant;
 use smoltcp::wire::{IpCidr, Ipv4Address, TcpPacket};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_void};
 use std::sync::Mutex;
 use tokio::runtime::Runtime;
-use tracing::{info, Level};
+use tokio::sync::mpsc;
+use tracing::{error, info, Level};
 use tracing_subscriber;
 
 /// A simple buffer-backed device for smoltcp
 struct TunDevice {
-    inbound_packets: VecDeque<Vec<u8>>,
+    inbound_packets: VecDeque<Bytes>,
     outbound_callback: Option<PacketCallback>,
 }
 
@@ -44,7 +46,7 @@ impl Device for TunDevice {
 }
 
 struct RxToken {
-    packet: Vec<u8>,
+    packet: Bytes,
 }
 
 impl smoltcp::phy::RxToken for RxToken {
@@ -74,13 +76,19 @@ impl<'a> smoltcp::phy::TxToken for TxToken<'a> {
     }
 }
 
+/// Represents an active TCP session being proxied.
+struct Session {
+    to_proxy_tx: mpsc::Sender<Bytes>,
+    from_proxy_rx: mpsc::Receiver<Bytes>,
+}
+
 /// The core engine managing the TCP/IP stack and proxy logic.
 struct StunnelEngine {
     device: TunDevice,
     interface: Interface,
     sockets: SocketSet<'static>,
-    #[allow(dead_code)]
     runtime: Runtime,
+    sessions: HashMap<SocketHandle, Session>,
 }
 
 impl StunnelEngine {
@@ -93,14 +101,12 @@ impl StunnelEngine {
         let config = Config::new(smoltcp::wire::HardwareAddress::Ip);
         let mut interface = Interface::new(config, &mut device, Instant::now());
 
-        // Configure the local interface address (this is the virtual address within smoltcp)
         interface.update_ip_addrs(|addrs| {
             addrs
                 .push(IpCidr::new(Ipv4Address::new(192, 168, 1, 1).into(), 24))
                 .unwrap();
         });
 
-        // Default route to capture all traffic
         interface
             .routes_mut()
             .add_default_ipv4_route(Ipv4Address::new(192, 168, 1, 1))
@@ -114,27 +120,20 @@ impl StunnelEngine {
             interface,
             sockets,
             runtime,
+            sessions: HashMap::new(),
         }
     }
 
-    fn handle_new_packet(&mut self, packet_data: Vec<u8>) {
-        // Inspect if it's a TCP SYN packet to dynamically create a socket
+    fn handle_new_packet(&mut self, packet_data: Bytes) {
         if let Ok(ip_packet) = smoltcp::wire::Ipv4Packet::new_checked(&packet_data) {
             if ip_packet.next_header() == smoltcp::wire::IpProtocol::Tcp {
                 if let Ok(tcp_packet) = TcpPacket::new_checked(ip_packet.payload()) {
                     if tcp_packet.syn() && !tcp_packet.ack() {
-                        let src_addr = ip_packet.src_addr();
-                        let src_port = tcp_packet.src_port();
                         let dst_addr = ip_packet.dst_addr();
                         let dst_port = tcp_packet.dst_port();
 
-                        info!(
-                            "Intercepted TCP SYN: {}:{} -> {}:{}",
-                            src_addr, src_port, dst_addr, dst_port
-                        );
-
-                        // Create a new socket for this connection
-                        self.create_socket(src_addr, src_port, dst_addr, dst_port);
+                        info!("Intercepted TCP SYN to {}:{}", dst_addr, dst_port);
+                        self.create_socket(dst_addr, dst_port);
                     }
                 }
             }
@@ -144,22 +143,13 @@ impl StunnelEngine {
         self.poll();
     }
 
-    fn create_socket(
-        &mut self,
-        _src_addr: Ipv4Address,
-        _src_port: u16,
-        dst_addr: Ipv4Address,
-        dst_port: u16,
-    ) {
+    fn create_socket(&mut self, dst_addr: Ipv4Address, dst_port: u16) {
         let tcp_rx_buffer = TcpSocketBuffer::new(vec![0; 65536]);
         let tcp_tx_buffer = TcpSocketBuffer::new(vec![0; 65536]);
         let mut socket = TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer);
 
-        // Here we use listen on the target address/port to "accept" the intercepted packet
-        // This is a simplified approach; true transparent proxying might need more care
-        // with the smoltcp interface to ensure it responds to packets not addressed to it.
         if let Err(e) = socket.listen((dst_addr, dst_port)) {
-            info!("Failed to listen on socket: {:?}", e);
+            error!("Failed to listen on socket: {:?}", e);
         } else {
             self.sockets.add(socket);
         }
@@ -169,16 +159,76 @@ impl StunnelEngine {
         let timestamp = Instant::now();
         self.interface
             .poll(timestamp, &mut self.device, &mut self.sockets);
-        self.check_sockets();
+        self.manage_sessions();
     }
 
-    fn check_sockets(&mut self) {
-        for (_handle, socket) in self.sockets.iter_mut() {
+    fn manage_sessions(&mut self) {
+        let mut to_remove = Vec::new();
+        let mut to_start = Vec::new();
+
+        // 1. Identify connections to start or pump
+        for (handle, socket) in self.sockets.iter_mut() {
             if let Some(tcp_socket) = TcpSocket::downcast_mut(socket) {
-                if tcp_socket.is_active() && tcp_socket.may_recv() {
-                    // TODO: Bridge to outbound stunnel proxy
+                if tcp_socket.is_active() {
+                    if !self.sessions.contains_key(&handle) {
+                        to_start.push(handle);
+                    } else {
+                        // Pump data Smoltcp -> MPSC
+                        if tcp_socket.can_recv() {
+                            let session = self.sessions.get_mut(&handle).unwrap();
+                            let _ = tcp_socket.recv(|data| {
+                                if !data.is_empty() {
+                                    let _ = session.to_proxy_tx.try_send(Bytes::copy_from_slice(data));
+                                }
+                                (data.len(), ())
+                            });
+                        }
+                    }
+                } else if self.sessions.contains_key(&handle) {
+                    to_remove.push(handle);
                 }
             }
+        }
+
+        // 2. Start new sessions
+        for handle in to_start {
+            let socket = self.sockets.get_mut::<TcpSocket>(handle);
+            let remote_endpoint = socket.remote_endpoint();
+            info!("Starting proxy session for {:?}", remote_endpoint);
+
+            let (to_proxy_tx, mut to_proxy_rx) = mpsc::channel::<Bytes>(100);
+            let (_from_proxy_tx, from_proxy_rx) = mpsc::channel::<Bytes>(100);
+
+            self.sessions.insert(
+                handle,
+                Session {
+                    to_proxy_tx,
+                    from_proxy_rx,
+                },
+            );
+
+            self.runtime.spawn(async move {
+                while let Some(data) = to_proxy_rx.recv().await {
+                    info!("Outbound task received {} bytes", data.len());
+                }
+            });
+        }
+
+        // 3. Pump MPSC -> Smoltcp
+        for (handle, session) in self.sessions.iter_mut() {
+            if let Ok(data) = session.from_proxy_rx.try_recv() {
+                let socket = self.sockets.get_mut::<TcpSocket>(*handle);
+                if socket.can_send() {
+                    let _ = socket.send_slice(&data);
+                }
+            }
+        }
+
+        // 4. Remove closed sessions
+        for handle in to_remove {
+            info!("Closing session for handle {:?}", handle);
+            self.sessions.remove(&handle);
+            self.sockets.remove(handle);
         }
     }
 }
@@ -223,11 +273,13 @@ pub extern "C" fn stunnel_process_packet(handle: *mut c_void, packet: *const u8,
         return;
     }
 
-    let packet_data = unsafe { std::slice::from_raw_parts(packet, len) }.to_vec();
+    let packet_data = unsafe { std::slice::from_raw_parts(packet, len) };
+    let bytes = Bytes::copy_from_slice(packet_data);
+    
     let engine_mutex = unsafe { &*(handle as *const Mutex<StunnelEngine>) };
 
     if let Ok(mut engine) = engine_mutex.lock() {
-        engine.handle_new_packet(packet_data);
+        engine.handle_new_packet(bytes);
     }
 }
 
