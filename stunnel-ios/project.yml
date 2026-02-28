@@ -1,0 +1,48 @@
+name: stunnel-ios
+options:
+  bundleIdPrefix: com.example
+  developmentLanguage: en
+
+targets:
+  stunnel-ios:
+    type: application
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: App
+    info:
+      path: App/Info.plist
+      properties:
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+          UISceneConfigurations: {}
+    dependencies:
+      - target: PacketTunnel
+        embed: true
+    settings:
+      CODE_SIGN_ENTITLEMENTS: stunnel-ios.entitlements
+      SWIFT_VERSION: 5.0
+
+  PacketTunnel:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: PacketTunnel
+      - path: Shared
+    info:
+      path: PacketTunnel/Info.plist
+      properties:
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
+          NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).PacketTunnelProvider"
+    dependencies:
+      - sdk: NetworkExtension.framework
+      - sdk: Security.framework
+    settings:
+      CODE_SIGN_ENTITLEMENTS: PacketTunnel.entitlements
+      SWIFT_VERSION: 5.0
+      SWIFT_OBJC_BRIDGING_HEADER: Shared/RustBridge.h
+      LIBRARY_SEARCH_PATHS: "$(inherited) $(SRCROOT)/../rust-core/target/aarch64-apple-ios-sim/release"
+      OTHER_LDFLAGS: "$(inherited) -lrust_core -lresolv"

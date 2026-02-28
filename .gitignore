@@ -1,2 +1,3 @@
 rust-core/target/
 .DS_Store
+\nstunnel-ios/**/*.xcodeproj
