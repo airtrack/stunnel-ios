@@ -8,12 +8,14 @@ use smoltcp::wire::{IpCidr, Ipv4Address, TcpPacket};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::CStr;
 use std::io;
+use std::net::SocketAddr;
 use std::os::raw::{c_char, c_void};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::runtime::Runtime;
+use tokio::sync::OnceCell;
 use tracing::{error, info, Level};
 use tracing_subscriber;
 
@@ -237,11 +239,18 @@ impl Drop for TcpStream {
     }
 }
 
+#[derive(Clone)]
+enum OutboundConnector {
+    S2nQuic(s2n_quic::connection::Handle),
+    TlsTcp(stunnel::tlstcp::client::Connector),
+}
+
 /// The main handle for the C interface.
 struct CoreContext {
     engine: Arc<Mutex<StunnelEngine>>,
     runtime: Runtime,
     config: AppConfig,
+    connector: OnceCell<OutboundConnector>,
 }
 
 #[unsafe(no_mangle)]
@@ -278,6 +287,7 @@ pub extern "C" fn stunnel_start(config_json_ptr: *const c_char) -> *mut c_void {
         engine,
         runtime,
         config,
+        connector: OnceCell::new(),
     });
     Box::into_raw(ctx) as *mut c_void
 }
@@ -324,10 +334,21 @@ pub extern "C" fn stunnel_process_packet(handle: *mut c_void, packet: *const u8,
                     let mut stream = TcpStream::new(socket_handle, Arc::clone(&ctx.engine));
                     let config = ctx.config.clone();
                     let target = format!("{}:{}", dst_addr, dst_port);
+                    let connector_cell = ctx.connector.clone();
 
                     ctx.runtime.spawn(async move {
                         info!("Proxy task started for {}", target);
-                        let result = handle_proxy_session(&mut stream, &config, &target).await;
+                        
+                        // Get or initialize the connector
+                        let connector = match get_connector(&connector_cell, &config).await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                error!("Failed to get connector: {:?}", e);
+                                return;
+                            }
+                        };
+
+                        let result = handle_proxy_session(&mut stream, connector, &target).await;
                         if let Err(e) = result {
                             error!("Proxy session failed for {}: {:?}", target, e);
                         }
@@ -342,47 +363,61 @@ pub extern "C" fn stunnel_process_packet(handle: *mut c_void, packet: *const u8,
     engine.poll();
 }
 
+async fn get_connector(
+    cell: &OnceCell<OutboundConnector>,
+    config: &AppConfig,
+) -> io::Result<OutboundConnector> {
+    cell.get_or_try_init(|| async {
+        match config.mode.as_str() {
+            "s2n-quic" => {
+                let quic_config = stunnel::quic::Config {
+                    addr: "0.0.0.0:0".to_string(),
+                    cert: config.cert.clone(),
+                    priv_key: config.priv_key.clone(),
+                    loss_threshold: 10,
+                };
+                let client = stunnel::quic::s2n_quic::client::new(&quic_config)?;
+                let addr: SocketAddr = config.server_addr.parse().map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid addr: {:?}", e))
+                })?;
+                let connect = s2n_quic::client::Connect::new(addr).with_server_name(config.server_name.as_str());
+                let mut conn = client.connect(connect).await.map_err(|e| {
+                    io::Error::new(io::ErrorKind::Other, format!("QUIC connect error: {:?}", e))
+                })?;
+                conn.keep_alive(true).map_err(|e| {
+                    io::Error::new(io::ErrorKind::Other, format!("QUIC keep-alive error: {:?}", e))
+                })?;
+                Ok(OutboundConnector::S2nQuic(conn.handle()))
+            }
+            "tlstcp" => {
+                let tls_config = stunnel::tlstcp::client::Config {
+                    server_addr: config.server_addr.clone(),
+                    server_name: config.server_name.clone(),
+                    cert: config.cert.clone(),
+                    priv_key: config.priv_key.clone(),
+                };
+                let connector = stunnel::tlstcp::client::new(&tls_config);
+                Ok(OutboundConnector::TlsTcp(connector))
+            }
+            _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "Unsupported mode")),
+        }
+    }).await.cloned()
+}
+
 async fn handle_proxy_session(
     stream: &mut TcpStream,
-    config: &AppConfig,
+    connector: OutboundConnector,
     target: &str,
 ) -> io::Result<()> {
-    match config.mode.as_str() {
-        "s2n-quic" => {
-            let quic_config = stunnel::quic::Config {
-                addr: config.server_addr.clone(),
-                cert: config.cert.clone(),
-                priv_key: config.priv_key.clone(),
-                loss_threshold: 10, // Default
-            };
-            let client = stunnel::quic::s2n_quic::client::new(&quic_config)?;
-            let addr: std::net::SocketAddr = config.server_addr.parse().map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid addr: {:?}", e))
-            })?;
-            let connect = s2n_quic::client::Connect::new(addr).with_server_name(config.server_name.as_str());
-            let conn = client.connect(connect).await.map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("QUIC connect error: {:?}", e))
-            })?;
-            let mut tunnel = stunnel::tunnel::client::connect_tcp_tunnel(conn.handle(), target).await?.1;
+    match connector {
+        OutboundConnector::S2nQuic(handle) => {
+            let mut tunnel = stunnel::tunnel::client::connect_tcp_tunnel(handle, target).await?.1;
             tokio::io::copy_bidirectional(stream, &mut tunnel).await?;
         }
-        "tlstcp" => {
-            let tls_config = stunnel::tlstcp::client::Config {
-                server_addr: config.server_addr.clone(),
-                server_name: config.server_name.clone(),
-                cert: config.cert.clone(),
-                priv_key: config.priv_key.clone(),
-            };
-            let connector = stunnel::tlstcp::client::new(&tls_config);
+        OutboundConnector::TlsTcp(connector) => {
             let mut tunnel = stunnel::tunnel::client::connect_tcp_tunnel(connector, target).await?.1;
             tokio::io::copy_bidirectional(stream, &mut tunnel).await?;
         }
-        "quinn-quic" => {
-            // Similar to s2n-quic, but using quinn
-            // For now, let's just use s2n-quic or tlstcp
-            return Err(io::Error::new(io::ErrorKind::Unsupported, "quinn-quic not implemented yet"));
-        }
-        _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Unsupported mode")),
     }
     Ok(())
 }
