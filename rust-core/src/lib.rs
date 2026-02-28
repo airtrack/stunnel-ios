@@ -2,10 +2,14 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use smoltcp::iface::{Config as SmolConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium};
-use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState};
-use smoltcp::socket::udp::{PacketBuffer as UdpPacketBuffer, PacketMetadata as UdpPacketMetadata, Socket as SmolUdpSocket};
+use smoltcp::socket::tcp::{
+    Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState,
+};
+use smoltcp::socket::udp::{
+    PacketBuffer as UdpPacketBuffer, PacketMetadata as UdpPacketMetadata, Socket as SmolUdpSocket,
+};
 use smoltcp::time::Instant;
-use smoltcp::wire::{IpCidr, Ipv4Address, IpProtocol, TcpPacket, UdpPacket};
+use smoltcp::wire::{IpCidr, IpProtocol, Ipv4Address, TcpPacket, UdpPacket};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::CStr;
 use std::io;
@@ -20,7 +24,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::runtime::Runtime;
 use tokio::sync::{Mutex as TokioMutex, OnceCell};
 use tokio::time::Instant as TokioInstant;
-use tracing::{error, info, Level};
+use tracing::{Level, error, info};
 use tracing_subscriber;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -39,8 +43,14 @@ struct TunDevice {
 }
 
 impl Device for TunDevice {
-    type RxToken<'a> = RxToken where Self: 'a;
-    type TxToken<'a> = TxToken<'a> where Self: 'a;
+    type RxToken<'a>
+        = RxToken
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = TxToken<'a>
+    where
+        Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         if let Some(packet) = self.inbound_packets.pop_front() {
@@ -298,8 +308,14 @@ impl UdpSocket {
         let socket = engine.sockets.get_mut::<SmolUdpSocket>(self.handle);
 
         let endpoint = match target {
-            SocketAddr::V4(v4) => smoltcp::wire::IpEndpoint::new(smoltcp::wire::IpAddress::Ipv4(v4.ip().clone().into()), v4.port()),
-            SocketAddr::V6(v6) => smoltcp::wire::IpEndpoint::new(smoltcp::wire::IpAddress::Ipv6(v6.ip().clone().into()), v6.port()),
+            SocketAddr::V4(v4) => smoltcp::wire::IpEndpoint::new(
+                smoltcp::wire::IpAddress::Ipv4((*v4.ip()).into()),
+                v4.port(),
+            ),
+            SocketAddr::V6(v6) => smoltcp::wire::IpEndpoint::new(
+                smoltcp::wire::IpAddress::Ipv6((*v6.ip()).into()),
+                v6.port(),
+            ),
         };
 
         match socket.send_slice(buf, endpoint) {
@@ -366,7 +382,8 @@ impl ConnectionManager {
             info!("QUIC connection broken, reconnecting...");
         }
 
-        let client = self.s2n_client
+        let client = self
+            .s2n_client
             .get_or_try_init(|| async {
                 let quic_config = stunnel::quic::Config {
                     addr: "0.0.0.0:0".to_string(),
@@ -379,7 +396,10 @@ impl ConnectionManager {
             .await?;
 
         let addr: SocketAddr = config.server_addr.parse().map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid addr: {:?}", e))
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid addr: {:?}", e),
+            )
         })?;
         let connect =
             s2n_quic::client::Connect::new(addr).with_server_name(config.server_name.as_str());
@@ -388,7 +408,10 @@ impl ConnectionManager {
             io::Error::new(io::ErrorKind::Other, format!("QUIC connect error: {:?}", e))
         })?;
         conn.keep_alive(true).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("QUIC keep-alive error: {:?}", e))
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("QUIC keep-alive error: {:?}", e),
+            )
         })?;
 
         let handle = conn.handle();
@@ -423,6 +446,31 @@ struct CoreContext {
     conn_manager: Arc<ConnectionManager>,
 }
 
+fn is_private_v4(addr: Ipv4Address) -> bool {
+    let octets = addr.octets();
+    // 10.0.0.0/8
+    if octets[0] == 10 {
+        return true;
+    }
+    // 172.16.0.0/12
+    if octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31 {
+        return true;
+    }
+    // 192.168.0.0/16
+    if octets[0] == 192 && octets[1] == 168 {
+        return true;
+    }
+    // 127.0.0.0/8
+    if octets[0] == 127 {
+        return true;
+    }
+    // 169.254.0.0/16
+    if octets[0] == 169 && octets[1] == 254 {
+        return true;
+    }
+    false
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn stunnel_init_logging() {
     let _ = tracing_subscriber::fmt()
@@ -448,7 +496,10 @@ pub extern "C" fn stunnel_start(config_json_ptr: *const c_char) -> *mut c_void {
         }
     };
 
-    info!("Starting stunnel-ios core engine with mode: {}", config.mode);
+    info!(
+        "Starting stunnel-ios core engine with mode: {}",
+        config.mode
+    );
 
     let engine = Arc::new(Mutex::new(StunnelEngine::new()));
     let runtime = Runtime::new().unwrap();
@@ -489,13 +540,17 @@ pub extern "C" fn stunnel_process_packet(handle: *mut c_void, packet: *const u8,
     if let Ok(ip_packet) = smoltcp::wire::Ipv4Packet::new_checked(&bytes) {
         let src_addr = ip_packet.src_addr();
         let dst_addr = ip_packet.dst_addr();
+        let is_direct = is_private_v4(dst_addr);
 
         match ip_packet.next_header() {
             IpProtocol::Tcp => {
                 if let Ok(tcp_packet) = TcpPacket::new_checked(ip_packet.payload()) {
                     if tcp_packet.syn() && !tcp_packet.ack() {
                         let dst_port = tcp_packet.dst_port();
-                        info!("Intercepted TCP SYN to {}:{}", dst_addr, dst_port);
+                        info!(
+                            "Intercepted TCP SYN to {}:{} (direct: {})",
+                            dst_addr, dst_port, is_direct
+                        );
 
                         let tcp_rx_buffer = TcpSocketBuffer::new(vec![0; 65536]);
                         let tcp_tx_buffer = TcpSocketBuffer::new(vec![0; 65536]);
@@ -509,9 +564,19 @@ pub extern "C" fn stunnel_process_packet(handle: *mut c_void, packet: *const u8,
                         let conn_manager = Arc::clone(&ctx.conn_manager);
 
                         ctx.runtime.spawn(async move {
-                            let result = handle_tcp_proxy_session(&mut stream, &config, &target, &conn_manager).await;
+                            let result = if is_direct {
+                                handle_tcp_direct_session(&mut stream, &target).await
+                            } else {
+                                handle_tcp_proxy_session(
+                                    &mut stream,
+                                    &config,
+                                    &target,
+                                    &conn_manager,
+                                )
+                                .await
+                            };
                             if let Err(e) = result {
-                                error!("TCP proxy session failed for {}: {:?}", target, e);
+                                error!("TCP session failed for {}: {:?}", target, e);
                             }
                         });
                     }
@@ -521,13 +586,23 @@ pub extern "C" fn stunnel_process_packet(handle: *mut c_void, packet: *const u8,
                 if let Ok(udp_packet) = UdpPacket::new_checked(ip_packet.payload()) {
                     let src_port = udp_packet.src_port();
                     let dst_port = udp_packet.dst_port();
-                    let src_endpoint = SocketAddr::new(std::net::IpAddr::V4(src_addr.into()), src_port);
+                    let src_endpoint =
+                        SocketAddr::new(std::net::IpAddr::V4(src_addr.into()), src_port);
 
                     if !engine.udp_sessions.contains_key(&src_endpoint) {
-                        info!("Intercepted new UDP session from {}", src_endpoint);
-                        
-                        let udp_rx_buffer = UdpPacketBuffer::new(vec![UdpPacketMetadata::EMPTY; 16], vec![0; 65536]);
-                        let udp_tx_buffer = UdpPacketBuffer::new(vec![UdpPacketMetadata::EMPTY; 16], vec![0; 65536]);
+                        info!(
+                            "Intercepted new UDP session from {} (direct: {})",
+                            src_endpoint, is_direct
+                        );
+
+                        let udp_rx_buffer = UdpPacketBuffer::new(
+                            vec![UdpPacketMetadata::EMPTY; 16],
+                            vec![0; 65536],
+                        );
+                        let udp_tx_buffer = UdpPacketBuffer::new(
+                            vec![UdpPacketMetadata::EMPTY; 16],
+                            vec![0; 65536],
+                        );
                         let mut socket = SmolUdpSocket::new(udp_rx_buffer, udp_tx_buffer);
                         socket.bind((dst_addr, dst_port)).unwrap();
                         let socket_handle = engine.sockets.add(socket);
@@ -536,11 +611,24 @@ pub extern "C" fn stunnel_process_packet(handle: *mut c_void, packet: *const u8,
                         let proxy_socket = UdpSocket::new(socket_handle, Arc::clone(&ctx.engine));
                         let config = ctx.config.clone();
                         let conn_manager = Arc::clone(&ctx.conn_manager);
+                        let target_addr =
+                            SocketAddr::new(std::net::IpAddr::V4(dst_addr.into()), dst_port);
 
                         ctx.runtime.spawn(async move {
-                            let result = handle_udp_proxy_session(proxy_socket, src_endpoint, &config, &conn_manager).await;
+                            let result = if is_direct {
+                                handle_udp_direct_session(proxy_socket, src_endpoint, target_addr)
+                                    .await
+                            } else {
+                                handle_udp_proxy_session(
+                                    proxy_socket,
+                                    src_endpoint,
+                                    &config,
+                                    &conn_manager,
+                                )
+                                .await
+                            };
                             if let Err(e) = result {
-                                error!("UDP proxy session failed for {}: {:?}", src_endpoint, e);
+                                error!("UDP session failed for {}: {:?}", src_endpoint, e);
                             }
                         });
                     }
@@ -554,6 +642,12 @@ pub extern "C" fn stunnel_process_packet(handle: *mut c_void, packet: *const u8,
     engine.poll();
 }
 
+async fn handle_tcp_direct_session(stream: &mut TcpStream, target: &str) -> io::Result<()> {
+    let mut outbound = tokio::net::TcpStream::connect(target).await?;
+    tokio::io::copy_bidirectional(stream, &mut outbound).await?;
+    Ok(())
+}
+
 async fn handle_tcp_proxy_session(
     stream: &mut TcpStream,
     config: &AppConfig,
@@ -562,14 +656,67 @@ async fn handle_tcp_proxy_session(
 ) -> io::Result<()> {
     if config.mode == "s2n-quic" {
         let handle = conn_manager.get_s2n_handle(config).await?;
-        let mut tunnel = stunnel::tunnel::client::connect_tcp_tunnel(handle, target).await?.1;
+        let mut tunnel = stunnel::tunnel::client::connect_tcp_tunnel(handle, target)
+            .await?
+            .1;
         tokio::io::copy_bidirectional(stream, &mut tunnel).await?;
     } else if config.mode == "tlstcp" {
         let connector = conn_manager.get_tlstcp_connector(config).await?;
-        let mut tunnel = stunnel::tunnel::client::connect_tcp_tunnel(connector, target).await?.1;
+        let mut tunnel = stunnel::tunnel::client::connect_tcp_tunnel(connector, target)
+            .await?
+            .1;
         tokio::io::copy_bidirectional(stream, &mut tunnel).await?;
     }
     Ok(())
+}
+
+async fn handle_udp_direct_session(
+    socket: UdpSocket,
+    src_endpoint: SocketAddr,
+    target_addr: SocketAddr,
+) -> io::Result<()> {
+    let outbound = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+    outbound.connect(target_addr).await?;
+
+    let last_activity = Arc::new(TokioMutex::new(TokioInstant::now()));
+
+    let last_activity_s = Arc::clone(&last_activity);
+    let s_task = async {
+        let mut buf = vec![0u8; 2048];
+        loop {
+            let (n, addr) = std::future::poll_fn(|cx| socket.poll_recv_from(cx, &mut buf)).await?;
+            if addr == src_endpoint {
+                *last_activity_s.lock().await = TokioInstant::now();
+                outbound.send(&buf[..n]).await?;
+            }
+        }
+    };
+
+    let last_activity_r = Arc::clone(&last_activity);
+    let r_task = async {
+        let mut buf = vec![0u8; 2048];
+        loop {
+            let n = outbound.recv(&mut buf).await?;
+            *last_activity_r.lock().await = TokioInstant::now();
+            std::future::poll_fn(|cx| socket.poll_send_to(cx, &buf[..n], target_addr)).await?;
+        }
+    };
+
+    let timeout_task = async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let last = *last_activity.lock().await;
+            if last.elapsed() > Duration::from_secs(60) {
+                return Ok(());
+            }
+        }
+    };
+
+    tokio::select! {
+        res = s_task => res,
+        res = r_task => res,
+        res = timeout_task => res,
+    }
 }
 
 async fn handle_udp_proxy_session(
