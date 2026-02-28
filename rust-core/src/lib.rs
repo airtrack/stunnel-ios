@@ -1,16 +1,19 @@
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium};
-use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer};
+use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState};
 use smoltcp::socket::AnySocket;
 use smoltcp::time::Instant;
 use smoltcp::wire::{IpCidr, Ipv4Address, TcpPacket};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::CStr;
+use std::io;
 use std::os::raw::{c_char, c_void};
-use std::sync::Mutex;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
 use tracing::{error, info, Level};
 use tracing_subscriber;
 
@@ -76,19 +79,12 @@ impl<'a> smoltcp::phy::TxToken for TxToken<'a> {
     }
 }
 
-/// Represents an active TCP session being proxied.
-struct Session {
-    to_proxy_tx: mpsc::Sender<Bytes>,
-    from_proxy_rx: mpsc::Receiver<Bytes>,
-}
-
-/// The core engine managing the TCP/IP stack and proxy logic.
+/// The core engine managing the TCP/IP stack.
 struct StunnelEngine {
     device: TunDevice,
     interface: Interface,
     sockets: SocketSet<'static>,
-    runtime: Runtime,
-    sessions: HashMap<SocketHandle, Session>,
+    wakers: HashMap<SocketHandle, Waker>,
 }
 
 impl StunnelEngine {
@@ -112,46 +108,11 @@ impl StunnelEngine {
             .add_default_ipv4_route(Ipv4Address::new(192, 168, 1, 1))
             .unwrap();
 
-        let sockets = SocketSet::new(vec![]);
-        let runtime = Runtime::new().unwrap();
-
         StunnelEngine {
             device,
             interface,
-            sockets,
-            runtime,
-            sessions: HashMap::new(),
-        }
-    }
-
-    fn handle_new_packet(&mut self, packet_data: Bytes) {
-        if let Ok(ip_packet) = smoltcp::wire::Ipv4Packet::new_checked(&packet_data) {
-            if ip_packet.next_header() == smoltcp::wire::IpProtocol::Tcp {
-                if let Ok(tcp_packet) = TcpPacket::new_checked(ip_packet.payload()) {
-                    if tcp_packet.syn() && !tcp_packet.ack() {
-                        let dst_addr = ip_packet.dst_addr();
-                        let dst_port = tcp_packet.dst_port();
-
-                        info!("Intercepted TCP SYN to {}:{}", dst_addr, dst_port);
-                        self.create_socket(dst_addr, dst_port);
-                    }
-                }
-            }
-        }
-
-        self.device.inbound_packets.push_back(packet_data);
-        self.poll();
-    }
-
-    fn create_socket(&mut self, dst_addr: Ipv4Address, dst_port: u16) {
-        let tcp_rx_buffer = TcpSocketBuffer::new(vec![0; 65536]);
-        let tcp_tx_buffer = TcpSocketBuffer::new(vec![0; 65536]);
-        let mut socket = TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer);
-
-        if let Err(e) = socket.listen((dst_addr, dst_port)) {
-            error!("Failed to listen on socket: {:?}", e);
-        } else {
-            self.sockets.add(socket);
+            sockets: SocketSet::new(vec![]),
+            wakers: HashMap::new(),
         }
     }
 
@@ -159,78 +120,119 @@ impl StunnelEngine {
         let timestamp = Instant::now();
         self.interface
             .poll(timestamp, &mut self.device, &mut self.sockets);
-        self.manage_sessions();
+
+        // Wake up all registered wakers to check their socket status
+        for waker in self.wakers.values() {
+            waker.wake_by_ref();
+        }
+        self.wakers.clear();
     }
 
-    fn manage_sessions(&mut self) {
-        let mut to_remove = Vec::new();
-        let mut to_start = Vec::new();
+    fn register_waker(&mut self, handle: SocketHandle, waker: Waker) {
+        self.wakers.insert(handle, waker);
+    }
+}
 
-        // 1. Identify connections to start or pump
-        for (handle, socket) in self.sockets.iter_mut() {
-            if let Some(tcp_socket) = TcpSocket::downcast_mut(socket) {
-                if tcp_socket.is_active() {
-                    if !self.sessions.contains_key(&handle) {
-                        to_start.push(handle);
-                    } else {
-                        // Pump data Smoltcp -> MPSC
-                        if tcp_socket.can_recv() {
-                            let session = self.sessions.get_mut(&handle).unwrap();
-                            let _ = tcp_socket.recv(|data| {
-                                if !data.is_empty() {
-                                    let _ = session.to_proxy_tx.try_send(Bytes::copy_from_slice(data));
-                                }
-                                (data.len(), ())
-                            });
-                        }
-                    }
-                } else if self.sessions.contains_key(&handle) {
-                    to_remove.push(handle);
-                }
-            }
-        }
+/// A virtual TcpStream that bridges smoltcp and tokio.
+pub struct TcpStream {
+    handle: SocketHandle,
+    engine: Arc<Mutex<StunnelEngine>>,
+}
 
-        // 2. Start new sessions
-        for handle in to_start {
-            let socket = self.sockets.get_mut::<TcpSocket>(handle);
-            let remote_endpoint = socket.remote_endpoint();
-            info!("Starting proxy session for {:?}", remote_endpoint);
+impl TcpStream {
+    fn new(handle: SocketHandle, engine: Arc<Mutex<StunnelEngine>>) -> Self {
+        TcpStream { handle, engine }
+    }
+}
 
-            let (to_proxy_tx, mut to_proxy_rx) = mpsc::channel::<Bytes>(100);
-            let (_from_proxy_tx, from_proxy_rx) = mpsc::channel::<Bytes>(100);
+impl AsyncRead for TcpStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let mut engine = self.engine.lock().unwrap();
+        let socket = engine.sockets.get_mut::<TcpSocket>(self.handle);
 
-            self.sessions.insert(
-                handle,
-                Session {
-                    to_proxy_tx,
-                    from_proxy_rx,
-                },
-            );
-
-            self.runtime.spawn(async move {
-                while let Some(data) = to_proxy_rx.recv().await {
-                    info!("Outbound task received {} bytes", data.len());
-                }
+        if socket.can_recv() {
+            let result = socket.recv(|data| {
+                let n = std::cmp::min(data.len(), buf.remaining());
+                buf.put_slice(&data[..n]);
+                (n, ())
             });
-        }
 
-        // 3. Pump MPSC -> Smoltcp
-        for (handle, session) in self.sessions.iter_mut() {
-            if let Ok(data) = session.from_proxy_rx.try_recv() {
-                let socket = self.sockets.get_mut::<TcpSocket>(*handle);
-                if socket.can_send() {
-                    let _ = socket.send_slice(&data);
+            match result {
+                Ok(_) => Poll::Ready(Ok(())),
+                Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+            }
+        } else {
+            match socket.state() {
+                TcpState::Closed | TcpState::CloseWait | TcpState::Closing | TcpState::LastAck => {
+                    Poll::Ready(Ok(())) // EOF
+                }
+                _ => {
+                    engine.register_waker(self.handle, cx.waker().clone());
+                    Poll::Pending
                 }
             }
         }
+    }
+}
 
-        // 4. Remove closed sessions
-        for handle in to_remove {
-            info!("Closing session for handle {:?}", handle);
-            self.sessions.remove(&handle);
-            self.sockets.remove(handle);
+impl AsyncWrite for TcpStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut engine = self.engine.lock().unwrap();
+        let socket = engine.sockets.get_mut::<TcpSocket>(self.handle);
+
+        if socket.can_send() {
+            match socket.send_slice(buf) {
+                Ok(n) => Poll::Ready(Ok(n)),
+                Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+            }
+        } else {
+            match socket.state() {
+                TcpState::Closed | TcpState::CloseWait | TcpState::Closing | TcpState::LastAck => {
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "connection closed",
+                    )))
+                }
+                _ => {
+                    engine.register_waker(self.handle, cx.waker().clone());
+                    Poll::Pending
+                }
+            }
         }
     }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut engine = self.engine.lock().unwrap();
+        let socket = engine.sockets.get_mut::<TcpSocket>(self.handle);
+        socket.close();
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for TcpStream {
+    fn drop(&mut self) {
+        let mut engine = self.engine.lock().unwrap();
+        engine.sockets.remove(self.handle);
+        info!("TcpStream dropped, handle {:?} removed", self.handle);
+    }
+}
+
+/// The main handle for the C interface.
+struct CoreContext {
+    engine: Arc<Mutex<StunnelEngine>>,
+    runtime: Runtime,
 }
 
 #[unsafe(no_mangle)]
@@ -252,8 +254,11 @@ pub extern "C" fn stunnel_start(config_json: *const c_char) -> *mut c_void {
 
     info!("Starting stunnel-ios core engine...");
 
-    let engine = Box::new(Mutex::new(StunnelEngine::new()));
-    Box::into_raw(engine) as *mut c_void
+    let engine = Arc::new(Mutex::new(StunnelEngine::new()));
+    let runtime = Runtime::new().unwrap();
+
+    let ctx = Box::new(CoreContext { engine, runtime });
+    Box::into_raw(ctx) as *mut c_void
 }
 
 #[unsafe(no_mangle)]
@@ -263,7 +268,7 @@ pub extern "C" fn stunnel_stop(handle: *mut c_void) {
     }
     info!("Stopping stunnel-ios core engine");
     unsafe {
-        let _ = Box::from_raw(handle as *mut Mutex<StunnelEngine>);
+        let _ = Box::from_raw(handle as *mut CoreContext);
     }
 }
 
@@ -273,14 +278,46 @@ pub extern "C" fn stunnel_process_packet(handle: *mut c_void, packet: *const u8,
         return;
     }
 
+    let ctx = unsafe { &*(handle as *const CoreContext) };
     let packet_data = unsafe { std::slice::from_raw_parts(packet, len) };
     let bytes = Bytes::copy_from_slice(packet_data);
-    
-    let engine_mutex = unsafe { &*(handle as *const Mutex<StunnelEngine>) };
 
-    if let Ok(mut engine) = engine_mutex.lock() {
-        engine.handle_new_packet(bytes);
+    let mut engine = ctx.engine.lock().unwrap();
+
+    // Intercept TCP SYN
+    if let Ok(ip_packet) = smoltcp::wire::Ipv4Packet::new_checked(&bytes) {
+        if ip_packet.next_header() == smoltcp::wire::IpProtocol::Tcp {
+            if let Ok(tcp_packet) = TcpPacket::new_checked(ip_packet.payload()) {
+                if tcp_packet.syn() && !tcp_packet.ack() {
+                    let dst_addr = ip_packet.dst_addr();
+                    let dst_port = tcp_packet.dst_port();
+                    
+                    info!("Intercepted TCP SYN to {}:{}", dst_addr, dst_port);
+
+                    let tcp_rx_buffer = TcpSocketBuffer::new(vec![0; 65536]);
+                    let tcp_tx_buffer = TcpSocketBuffer::new(vec![0; 65536]);
+                    let mut socket = TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer);
+                    socket.listen((dst_addr, dst_port)).unwrap();
+                    let socket_handle = engine.sockets.add(socket);
+
+                    let stream = TcpStream::new(socket_handle, Arc::clone(&ctx.engine));
+                    
+                    // Spawn task to handle the stream
+                    ctx.runtime.spawn(async move {
+                        info!("Proxy task started for {}:{}", dst_addr, dst_port);
+                        // TODO: Use tokio::io::copy_bidirectional with stunnel client
+                        let mut _stream = stream;
+                        // For now just prevent it from being dropped immediately
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        info!("Proxy task finished for {}:{}", dst_addr, dst_port);
+                    });
+                }
+            }
+        }
     }
+
+    engine.device.inbound_packets.push_back(bytes);
+    engine.poll();
 }
 
 type PacketCallback = extern "C" fn(*const u8, usize);
@@ -291,9 +328,8 @@ pub extern "C" fn stunnel_set_packet_callback(handle: *mut c_void, callback: Pac
         return;
     }
 
-    let engine_mutex = unsafe { &*(handle as *const Mutex<StunnelEngine>) };
-    if let Ok(mut engine) = engine_mutex.lock() {
-        engine.device.outbound_callback = Some(callback);
-        info!("Rust core: Packet callback registered");
-    }
+    let ctx = unsafe { &*(handle as *const CoreContext) };
+    let mut engine = ctx.engine.lock().unwrap();
+    engine.device.outbound_callback = Some(callback);
+    info!("Rust core: Packet callback registered");
 }
