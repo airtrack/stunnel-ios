@@ -1,8 +1,8 @@
 use bytes::Bytes;
-use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
+use serde::{Deserialize, Serialize};
+use smoltcp::iface::{Config as SmolConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState};
-use smoltcp::socket::AnySocket;
 use smoltcp::time::Instant;
 use smoltcp::wire::{IpCidr, Ipv4Address, TcpPacket};
 use std::collections::{HashMap, VecDeque};
@@ -16,6 +16,15 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::runtime::Runtime;
 use tracing::{error, info, Level};
 use tracing_subscriber;
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AppConfig {
+    pub mode: String, // "tlstcp", "quinn-quic", "s2n-quic"
+    pub server_addr: String,
+    pub server_name: String,
+    pub cert: String,
+    pub priv_key: String,
+}
 
 /// A simple buffer-backed device for smoltcp
 struct TunDevice {
@@ -94,7 +103,7 @@ impl StunnelEngine {
             outbound_callback: None,
         };
 
-        let config = Config::new(smoltcp::wire::HardwareAddress::Ip);
+        let config = SmolConfig::new(smoltcp::wire::HardwareAddress::Ip);
         let mut interface = Interface::new(config, &mut device, Instant::now());
 
         interface.update_ip_addrs(|addrs| {
@@ -121,7 +130,6 @@ impl StunnelEngine {
         self.interface
             .poll(timestamp, &mut self.device, &mut self.sockets);
 
-        // Wake up all registered wakers to check their socket status
         for waker in self.wakers.values() {
             waker.wake_by_ref();
         }
@@ -233,6 +241,7 @@ impl Drop for TcpStream {
 struct CoreContext {
     engine: Arc<Mutex<StunnelEngine>>,
     runtime: Runtime,
+    config: AppConfig,
 }
 
 #[unsafe(no_mangle)]
@@ -244,20 +253,32 @@ pub extern "C" fn stunnel_init_logging() {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn stunnel_start(config_json: *const c_char) -> *mut c_void {
-    let _config_str = unsafe {
-        if config_json.is_null() {
+pub extern "C" fn stunnel_start(config_json_ptr: *const c_char) -> *mut c_void {
+    let config_json = unsafe {
+        if config_json_ptr.is_null() {
             return std::ptr::null_mut();
         }
-        CStr::from_ptr(config_json).to_string_lossy()
+        CStr::from_ptr(config_json_ptr).to_string_lossy()
     };
 
-    info!("Starting stunnel-ios core engine...");
+    let config: AppConfig = match serde_json::from_str(&config_json) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Failed to parse config: {:?}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    info!("Starting stunnel-ios core engine with mode: {}", config.mode);
 
     let engine = Arc::new(Mutex::new(StunnelEngine::new()));
     let runtime = Runtime::new().unwrap();
 
-    let ctx = Box::new(CoreContext { engine, runtime });
+    let ctx = Box::new(CoreContext {
+        engine,
+        runtime,
+        config,
+    });
     Box::into_raw(ctx) as *mut c_void
 }
 
@@ -291,7 +312,7 @@ pub extern "C" fn stunnel_process_packet(handle: *mut c_void, packet: *const u8,
                 if tcp_packet.syn() && !tcp_packet.ack() {
                     let dst_addr = ip_packet.dst_addr();
                     let dst_port = tcp_packet.dst_port();
-                    
+
                     info!("Intercepted TCP SYN to {}:{}", dst_addr, dst_port);
 
                     let tcp_rx_buffer = TcpSocketBuffer::new(vec![0; 65536]);
@@ -300,16 +321,17 @@ pub extern "C" fn stunnel_process_packet(handle: *mut c_void, packet: *const u8,
                     socket.listen((dst_addr, dst_port)).unwrap();
                     let socket_handle = engine.sockets.add(socket);
 
-                    let stream = TcpStream::new(socket_handle, Arc::clone(&ctx.engine));
-                    
-                    // Spawn task to handle the stream
+                    let mut stream = TcpStream::new(socket_handle, Arc::clone(&ctx.engine));
+                    let config = ctx.config.clone();
+                    let target = format!("{}:{}", dst_addr, dst_port);
+
                     ctx.runtime.spawn(async move {
-                        info!("Proxy task started for {}:{}", dst_addr, dst_port);
-                        // TODO: Use tokio::io::copy_bidirectional with stunnel client
-                        let mut _stream = stream;
-                        // For now just prevent it from being dropped immediately
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        info!("Proxy task finished for {}:{}", dst_addr, dst_port);
+                        info!("Proxy task started for {}", target);
+                        let result = handle_proxy_session(&mut stream, &config, &target).await;
+                        if let Err(e) = result {
+                            error!("Proxy session failed for {}: {:?}", target, e);
+                        }
+                        info!("Proxy task finished for {}", target);
                     });
                 }
             }
@@ -318,6 +340,51 @@ pub extern "C" fn stunnel_process_packet(handle: *mut c_void, packet: *const u8,
 
     engine.device.inbound_packets.push_back(bytes);
     engine.poll();
+}
+
+async fn handle_proxy_session(
+    stream: &mut TcpStream,
+    config: &AppConfig,
+    target: &str,
+) -> io::Result<()> {
+    match config.mode.as_str() {
+        "s2n-quic" => {
+            let quic_config = stunnel::quic::Config {
+                addr: config.server_addr.clone(),
+                cert: config.cert.clone(),
+                priv_key: config.priv_key.clone(),
+                loss_threshold: 10, // Default
+            };
+            let client = stunnel::quic::s2n_quic::client::new(&quic_config)?;
+            let addr: std::net::SocketAddr = config.server_addr.parse().map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid addr: {:?}", e))
+            })?;
+            let connect = s2n_quic::client::Connect::new(addr).with_server_name(config.server_name.as_str());
+            let conn = client.connect(connect).await.map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("QUIC connect error: {:?}", e))
+            })?;
+            let mut tunnel = stunnel::tunnel::client::connect_tcp_tunnel(conn.handle(), target).await?.1;
+            tokio::io::copy_bidirectional(stream, &mut tunnel).await?;
+        }
+        "tlstcp" => {
+            let tls_config = stunnel::tlstcp::client::Config {
+                server_addr: config.server_addr.clone(),
+                server_name: config.server_name.clone(),
+                cert: config.cert.clone(),
+                priv_key: config.priv_key.clone(),
+            };
+            let connector = stunnel::tlstcp::client::new(&tls_config);
+            let mut tunnel = stunnel::tunnel::client::connect_tcp_tunnel(connector, target).await?.1;
+            tokio::io::copy_bidirectional(stream, &mut tunnel).await?;
+        }
+        "quinn-quic" => {
+            // Similar to s2n-quic, but using quinn
+            // For now, let's just use s2n-quic or tlstcp
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "quinn-quic not implemented yet"));
+        }
+        _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Unsupported mode")),
+    }
+    Ok(())
 }
 
 type PacketCallback = extern "C" fn(*const u8, usize);
