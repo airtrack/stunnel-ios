@@ -9,8 +9,8 @@ iOS enforces strict process isolation. The main UI and the proxy engine run in s
 *   **Host App:** The UI process. Handles configuration UI and VPN lifecycle management.
 *   **Network Extension:** The "Packet Tunnel Provider" process. Managed by the system as a daemon.
 
-### 2. Rust Proxy Core (Modular Design)
-The core logic is implemented in Rust for maximum performance and safety:
+### 2. Stunnel Proxy Core (Modular Design)
+The core logic is implemented in a modular functional library for maximum performance and safety:
 *   **`engine`**: Manages the `smoltcp` stack and virtual `TunDevice`.
 *   **`tcp` / `udp`**: Implements `TcpStream` and `UdpSocket` abstractions that satisfy `tokio`'s async traits, allowing high-level data forwarding.
 *   **`connection`**: Manages persistent outbound tunnels. Specifically optimized for **QUIC connection reuse** via `s2n-quic` handles.

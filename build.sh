@@ -33,8 +33,8 @@ echo "------------------------------------------------"
 echo "🚀 Starting build for $PROJECT_NAME (Mode: $MODE)"
 echo "------------------------------------------------"
 
-# 1. Build Rust Core
-echo "📦 Building Rust core library..."
+# 1. Build Stunnel Core
+echo "📦 Building Stunnel core library..."
 cd $RUST_CORE_DIR
 
 echo "  -> Target: aarch64-apple-ios-sim (Simulator)"

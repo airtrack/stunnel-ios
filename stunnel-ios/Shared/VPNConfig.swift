@@ -38,8 +38,8 @@ struct VPNConfig: Codable {
         return try? decoder.decode(VPNConfig.self, from: data)
     }
     
-    // Generate JSON for Rust, converting content to actual sandbox paths
-    func toRustConfigJSON() -> String? {
+    // Generate JSON for core engine, converting content to actual sandbox paths
+    func toStunnelConfigJSON() -> String? {
         guard let certPath = saveFile(name: "client.crt", content: cert),
               let keyPath = saveFile(name: "client.key", content: privKey) else {
             return nil

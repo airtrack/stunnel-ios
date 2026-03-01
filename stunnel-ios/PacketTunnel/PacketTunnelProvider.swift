@@ -9,9 +9,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     override func startTunnel(options: [String : NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         os_log(.info, "stunnel-ios: PacketTunnelProvider startTunnel initiated")
 
-        // 1. Initialize logging in Rust
+        // 1. Initialize logging in Stunnel core
         stunnel_init_logging()
-        os_log(.info, "stunnel-ios: Rust logging initialized")
+        os_log(.info, "stunnel-ios: Stunnel core logging initialized")
 
         // 2. Load configuration from App Group
         os_log(.info, "stunnel-ios: Loading config from App Group...")
@@ -21,8 +21,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
         
-        guard let configJson = config.toRustConfigJSON() else {
-            os_log(.error, "stunnel-ios: CRITICAL - Failed to generate Rust config JSON (cert write error?)")
+        guard let configJson = config.toStunnelConfigJSON() else {
+            os_log(.error, "stunnel-ios: CRITICAL - Failed to generate Stunnel config JSON (cert write error?)")
             completionHandler(NSError(domain: "stunnel-ios", code: 2, userInfo: [NSLocalizedDescriptionKey: "Failed to write cert files"]))
             return
         }
@@ -47,26 +47,26 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
 
-            os_log(.info, "stunnel-ios: Tunnel settings applied. Starting Rust core...")
+            os_log(.info, "stunnel-ios: Tunnel settings applied. Starting Stunnel core...")
             PacketTunnelProvider.shared = self
 
-            // 4. Start the Rust core
+            // 4. Start the Stunnel core
             self.rustHandle = stunnel_start(configJson)
             
             if self.rustHandle == nil {
-                os_log(.error, "stunnel-ios: CRITICAL - Rust core failed to start (stunnel_start returned nil)")
-                completionHandler(NSError(domain: "stunnel-ios", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to start Rust core"]))
+                os_log(.error, "stunnel-ios: CRITICAL - Stunnel core failed to start (stunnel_start returned nil)")
+                completionHandler(NSError(domain: "stunnel-ios", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to start Stunnel core"]))
                 return
             }
 
-            // 5. Setup callback from Rust to Swift
+            // 5. Setup callback from core to Swift
             let callback: @convention(c) (UnsafePointer<UInt8>?, Int) -> Void = { (packetPtr, len) in
                 guard let packetPtr = packetPtr else { return }
                 let data = Data(bytes: packetPtr, count: len)
                 PacketTunnelProvider.shared?.packetFlow.writePackets([data], withProtocols: [NSNumber(value: AF_INET)])
             }
             stunnel_set_packet_callback(self.rustHandle, callback)
-            os_log(.info, "stunnel-ios: Rust packet callback registered")
+            os_log(.info, "stunnel-ios: Stunnel core packet callback registered")
 
             // 6. Start reading packets from TUN
             os_log(.info, "stunnel-ios: Starting packet read loop")
