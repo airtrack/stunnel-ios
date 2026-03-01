@@ -1,22 +1,18 @@
 name: stunnel-ios
 options:
-  bundleIdPrefix: com.example
+  bundleIdPrefix: com.stunnel.ios
   developmentLanguage: en
 
 targets:
   stunnel-ios:
     type: application
     platform: iOS
-    deploymentTarget: "15.0"
+    deploymentTarget: "18.0"
+    bundleId: com.stunnel.ios
     sources:
       - path: App
     info:
       path: App/Info.plist
-      properties:
-        UILaunchScreen: {}
-        UIApplicationSceneManifest:
-          UIApplicationSupportsMultipleScenes: false
-          UISceneConfigurations: {}
     dependencies:
       - target: PacketTunnel
         embed: true
@@ -27,16 +23,13 @@ targets:
   PacketTunnel:
     type: app-extension
     platform: iOS
-    deploymentTarget: "15.0"
+    deploymentTarget: "18.0"
+    bundleId: com.stunnel.ios.PacketTunnel
     sources:
       - path: PacketTunnel
       - path: Shared
     info:
       path: PacketTunnel/Info.plist
-      properties:
-        NSExtension:
-          NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
-          NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).PacketTunnelProvider"
     dependencies:
       - sdk: NetworkExtension.framework
       - sdk: Security.framework

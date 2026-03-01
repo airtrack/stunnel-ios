@@ -4,6 +4,7 @@ import os.log
 class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private var rustHandle: UnsafeMutableRawPointer?
+    static var shared: PacketTunnelProvider?
 
     override func startTunnel(options: [String : NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         os_log(.info, "stunnel-ios: startTunnel")
@@ -11,16 +12,17 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // 1. Initialize logging in Rust
         stunnel_init_logging()
 
-        // 2. Configure the tunnel (example static config)
+        // 2. Configure the tunnel
         let tunnelNetworkSettings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
         
-        let ipv4Settings = NEIPv4Settings(addresses: ["192.168.1.1"], subnetMasks: ["255.255.255.0"])
+        // Internal IP for the virtual interface
+        let ipv4Settings = NEIPv4Settings(addresses: ["192.168.1.2"], subnetMasks: ["255.255.255.0"])
         ipv4Settings.includedRoutes = [NEIPv4Route.default()]
         tunnelNetworkSettings.ipv4Settings = ipv4Settings
         
         tunnelNetworkSettings.dnsSettings = NEDNSSettings(servers: ["8.8.8.8", "1.1.1.1"])
+        tunnelNetworkSettings.mtu = 1500
 
-        // 3. Set the network settings
         setTunnelNetworkSettings(tunnelNetworkSettings) { error in
             if let error = error {
                 os_log(.error, "stunnel-ios: Failed to set tunnel network settings: %{public}@", error.localizedDescription)
@@ -30,8 +32,17 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
             PacketTunnelProvider.shared = self
 
-            // 4. Start the Rust core
-            let configJson = "{}" // Placeholder for real config
+            // 3. Start the Rust core with real configuration
+            // In a real app, this config would come from the main app via App Groups
+            let configJson = """
+            {
+                "mode": "s2n-quic",
+                "server_addr": "your-proxy-server:443",
+                "server_name": "your-domain.com",
+                "cert": "path-to-cert",
+                "priv_key": "path-to-key"
+            }
+            """
             self.rustHandle = stunnel_start(configJson)
             
             if self.rustHandle == nil {
@@ -40,7 +51,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
 
-            self.setupRustPacketCallback()
+            // 4. Setup callback from Rust to Swift
+            let callback: @convention(c) (UnsafePointer<UInt8>?, Int) -> Void = { (packetPtr, len) in
+                guard let packetPtr = packetPtr else { return }
+                let data = Data(bytes: packetPtr, count: len)
+                PacketTunnelProvider.shared?.packetFlow.writePackets([data], withProtocols: [NSNumber(value: AF_INET)])
+            }
+            stunnel_set_packet_callback(self.rustHandle, callback)
 
             // 5. Start reading packets from TUN
             self.readPackets()
@@ -56,9 +73,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             stunnel_stop(handle)
             rustHandle = nil
         }
-
-        PacketTunnelProvider.shared = nil
         
+        PacketTunnelProvider.shared = nil
         completionHandler()
     }
 
@@ -74,20 +90,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
             }
             
-            // Continue reading
             self.readPackets()
         }
-    }
-
-    override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)? = nil) {
-        // Handle messages from the main app (e.g., status requests, config updates)
-        completionHandler?(nil)
-    }
-
-    override func sleep(completionHandler: @escaping () -> Void) {
-        completionHandler()
-    }
-
-    override func wake() {
     }
 }
