@@ -10,6 +10,9 @@ struct ContentView: View {
     @State private var cert: String = ""
     @State private var privKey: String = ""
     
+    @State private var errorMessage: String?
+    @State private var showError: Bool = false
+    
     let modes = ["s2n-quic", "tlstcp"]
     
     var body: some View {
@@ -24,15 +27,23 @@ struct ContentView: View {
                     
                     TextField("Server Address (IP:Port)", text: $serverAddr)
                         .autocapitalization(.none)
+                        .disableAutocorrection(true)
                     
                     TextField("Server Name (SNI)", text: $serverName)
                         .autocapitalization(.none)
-                    
-                    TextField("Certificate Path", text: $cert)
-                        .autocapitalization(.none)
-                    
-                    TextField("Private Key Path", text: $privKey)
-                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+                }
+                
+                Section(header: Text("Certificate (PEM Content)")) {
+                    TextEditor(text: $cert)
+                        .frame(height: 100)
+                        .font(.system(.caption, design: .monospaced))
+                }
+                
+                Section(header: Text("Private Key (PEM Content)")) {
+                    TextEditor(text: $privKey)
+                        .frame(height: 100)
+                        .font(.system(.caption, design: .monospaced))
                 }
                 
                 Section(header: Text("Status")) {
@@ -45,13 +56,22 @@ struct ContentView: View {
                 
                 Section {
                     Button(action: toggleVPN) {
-                        Text(vpnManager.status == .disconnected ? "Connect" : "Disconnect")
-                            .frame(maxWidth: .infinity)
-                            .foregroundColor(vpnManager.status == .disconnected ? .blue : .red)
+                        if vpnManager.status == .connecting || vpnManager.status == .reasserting {
+                            ProgressView()
+                                .progressViewStyle(CircularProgressViewStyle())
+                        } else {
+                            Text(vpnManager.status == .disconnected ? "Connect" : "Disconnect")
+                                .frame(maxWidth: .infinity)
+                                .foregroundColor(vpnManager.status == .disconnected ? .blue : .red)
+                        }
                     }
+                    .disabled(vpnManager.status == .connecting || vpnManager.status == .reasserting)
                 }
             }
             .navigationTitle("stunnel-ios")
+            .alert(isPresented: $showError) {
+                Alert(title: Text("Error"), message: Text(errorMessage ?? "Unknown error"), dismissButton: .default(Text("OK")))
+            }
             .onAppear {
                 if let config = VPNConfig.load() {
                     self.mode = config.mode
@@ -66,6 +86,12 @@ struct ContentView: View {
     
     private func toggleVPN() {
         if vpnManager.status == .disconnected {
+            if serverAddr.isEmpty || serverName.isEmpty || cert.isEmpty || privKey.isEmpty {
+                errorMessage = "Please fill in all configuration fields"
+                showError = true
+                return
+            }
+            
             let config = VPNConfig(
                 mode: mode,
                 serverAddr: serverAddr,
