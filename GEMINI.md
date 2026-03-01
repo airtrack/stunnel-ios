@@ -2,69 +2,70 @@
 
 `stunnel-ios` is a high-performance network proxy application for iOS. It leverages Apple's **Network Extension (NE)** framework to provide system-wide proxying capabilities with advanced split-tunneling features.
 
-The project is structured into three main components:
-1.  **Main App (Swift/SwiftUI):** A user-facing application for managing configurations, monitoring connection status, and controlling the proxy service.
-2.  **Packet Tunnel Provider (Swift Extension):** A dedicated background process that manages the virtual TUN interface, intercepts network traffic, and routes it through the proxy core.
-3.  **Rust Proxy Core:** A high-performance networking engine written in Rust that handles the heavy lifting of TCP/IP stack reconstruction, protocol encapsulation, and rule-based routing.
-
 ## Architecture
 
 ### 1. Process Isolation
 iOS enforces strict process isolation. The main UI and the proxy engine run in separate processes:
-*   **Host App:** The UI process. If killed by the system or user, the proxy service remains active.
-*   **Network Extension:** The "Packet Tunnel Provider" process. It is managed by the system and runs as a daemon while the VPN is active.
+*   **Host App:** The UI process. Handles configuration UI and VPN lifecycle management.
+*   **Network Extension:** The "Packet Tunnel Provider" process. Managed by the system as a daemon.
 
-### 2. Traffic Flow
-1.  **TUN Interface:** The Extension creates a virtual network interface.
-2.  **IP Packet Capture:** All device traffic (matching the routing rules) is routed to the TUN interface as Raw IP packets (Layer 3).
-3.  **User-mode TCP/IP Stack:** The Extension passes packets to the Rust Core, which uses a user-mode stack (e.g., `smoltcp`) to reconstruct TCP streams.
-4.  **Proxying:** Reconstructed streams are processed by the Rust proxy logic (split-tunneling, encryption, etc.) and sent to the remote proxy server via standard sockets.
+### 2. Rust Proxy Core (Modular Design)
+The core logic is implemented in Rust for maximum performance and safety:
+*   **`engine`**: Manages the `smoltcp` stack and virtual `TunDevice`.
+*   **`tcp` / `udp`**: Implements `TcpStream` and `UdpSocket` abstractions that satisfy `tokio`'s async traits, allowing high-level data forwarding.
+*   **`connection`**: Manages persistent outbound tunnels. Specifically optimized for **QUIC connection reuse** via `s2n-quic` handles.
+*   **`utils`**: Includes intelligent split-tunneling that automatically bypasses private/intranet IP addresses.
+
+### 3. Data Flow
+`TUN Interface` <-> `Swift Bridge` <-> `C-FFI` <-> `smoltcp` <-> `TcpStream/UdpSocket` <-> `stunnel client` <-> `Remote Server`
 
 ## Technology Stack
 
-*   **iOS Development:** Swift, SwiftUI, Network Extension Framework.
-*   **Core Logic:** Rust (compiled for `aarch64-apple-ios`).
-*   **Inter-Process Communication (IPC):** `NETunnelProviderManager`, App Groups (for shared configuration and status), Darwin Notifications.
-*   **Networking Stack:**
-    *   **smoltcp:** A standalone, event-driven TCP/IP stack that will be used to reconstruct TCP/UDP streams from raw IP packets received from the TUN interface.
-    *   **stunnel (Rust Core):** The existing proxy library (from `https://github.com/airtrack/stunnel.git`) will be integrated to handle the outbound proxying (TLS/QUIC tunnels) and split-tunneling logic.
-*   **Networking:** `tokio` for async I/O in the Rust core, bridging `smoltcp` stream data to the `stunnel` client logic.
+*   **iOS:** Swift 5, SwiftUI, Network Extension.
+*   **Rust Core:** Rust 2024 Edition, `smoltcp`, `tokio`, `s2n-quic`, `bytes`.
+*   **Build System:** `xcodegen` for Xcode project management, `build.sh` for unified compilation.
 
 ## Development Roadmap
 
 ### Phase 1: Environment Setup
-- [ ] Configure Apple Developer Program entitlements for Network Extension.
-- [ ] Set up Rust cross-compilation toolchain for iOS.
-- [ ] Create Xcode project with App and Extension targets.
+- [x] Configure Network Extension entitlements.
+- [x] Set up Rust cross-compilation toolchain for iOS & Simulator.
+- [x] Create declarative Xcode project using `xcodegen`.
 
 ### Phase 2: Rust Core Development
-- [ ] Implement C-FFI wrapper for Rust core.
-- [ ] Integrate user-mode TCP/IP stack.
-- [ ] Implement basic TCP split-tunneling logic.
+- [x] Implement C-FFI wrapper with safe memory management.
+- [x] Integrate `smoltcp` user-mode TCP/IP stack.
+- [x] Implement `AsyncRead`/`AsyncWrite` bridging for `smoltcp` sockets.
+- [x] Implement dynamic TCP/UDP interception and session management.
+- [x] Add Intranet Bypass (Private IP) logic.
 
 ### Phase 3: Extension Integration
-- [ ] Implement `NEPacketTunnelProvider` lifecycle methods (`startTunnel`, `stopTunnel`).
-- [ ] Bridge TUN packets to the Rust core via FFI.
-- [ ] Handle system-level routing and DNS configuration.
+- [x] Implement `NEPacketTunnelProvider` lifecycle and packet loop.
+- [x] Bridge TUN packets to Rust via C-FFI callbacks.
+- [x] Configure system-level IPv4 routing and DNS.
 
 ### Phase 4: UI & Configuration
-- [ ] Design SwiftUI interface for configuration editing.
-- [ ] Implement App Group-based configuration sharing.
-- [ ] Add connection status monitoring and logging.
+- [x] Design SwiftUI interface for PEM certificate management.
+- [x] Implement App Group-based configuration and certificate sharing.
+- [x] Implement `VPNManager` using `NETunnelProviderManager`.
 
 ## Building and Running
 
 ### Prerequisites
-*   Xcode 15+
-*   Rust toolchain (`rustup target add aarch64-apple-ios`)
-*   Apple Developer Account with Network Extension entitlement.
+*   macOS with **Xcode 15+**.
+*   **Paid Apple Developer Account** (Required for Network Extension entitlements).
+*   `xcodegen` and `xcbeautify` (via Homebrew).
 
 ### Build Commands
-*   **Rust Core:** `cargo build --target aarch64-apple-ios --release` (or using a dedicated script).
-*   **iOS App:** Build via Xcode using the `stunnel-ios` scheme.
+Use the unified build script:
+```bash
+# Build Release version (default)
+./build.sh
 
-## Development Conventions
+# Build Debug version
+./build.sh --debug
+```
 
-*   **Memory Management:** The Network Extension is limited to ~15-30MB of RAM. Avoid large buffers and ensure efficient memory usage in the Rust core.
-*   **Concurrency:** Use Swift `async/await` for UI/Extension logic and `tokio` for Rust async tasks.
-*   **Logging:** Use `os_log` or a shared log file in the App Group container for cross-process debugging.
+## Post-Development Notes
+*   **Signing:** The project uses Ad-hoc signing (`-`) for local builds but requires a valid Development Team ID in Xcode for actual deployment.
+*   **Memory:** The Rust core is optimized to stay within the ~15MB limit of the Network Extension.
