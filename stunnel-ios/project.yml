@@ -11,6 +11,7 @@ targets:
     bundleId: com.stunnel.ios
     sources:
       - path: App
+      - path: Shared
     info:
       path: App/Info.plist
     dependencies:

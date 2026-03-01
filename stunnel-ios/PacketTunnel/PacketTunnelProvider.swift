@@ -12,7 +12,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // 1. Initialize logging in Rust
         stunnel_init_logging()
 
-        // 2. Configure the tunnel
+        // 2. Load configuration from App Group
+        guard let config = VPNConfig.load(), let configJson = config.toJSONString() else {
+            os_log(.error, "stunnel-ios: Failed to load configuration")
+            completionHandler(NSError(domain: "stunnel-ios", code: 1, userInfo: [NSLocalizedDescriptionKey: "Failed to load configuration"]))
+            return
+        }
+
+        // 3. Configure the tunnel
         let tunnelNetworkSettings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
         
         // Internal IP for the virtual interface
@@ -32,17 +39,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
             PacketTunnelProvider.shared = self
 
-            // 3. Start the Rust core with real configuration
-            // In a real app, this config would come from the main app via App Groups
-            let configJson = """
-            {
-                "mode": "s2n-quic",
-                "server_addr": "your-proxy-server:443",
-                "server_name": "your-domain.com",
-                "cert": "path-to-cert",
-                "priv_key": "path-to-key"
-            }
-            """
+            // 4. Start the Rust core
+            os_log(.info, "stunnel-ios: Starting Rust core with mode %{public}@", config.mode)
             self.rustHandle = stunnel_start(configJson)
             
             if self.rustHandle == nil {
@@ -51,7 +49,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
 
-            // 4. Setup callback from Rust to Swift
+            // 5. Setup callback from Rust to Swift
             let callback: @convention(c) (UnsafePointer<UInt8>?, Int) -> Void = { (packetPtr, len) in
                 guard let packetPtr = packetPtr else { return }
                 let data = Data(bytes: packetPtr, count: len)
@@ -59,7 +57,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             }
             stunnel_set_packet_callback(self.rustHandle, callback)
 
-            // 5. Start reading packets from TUN
+            // 6. Start reading packets from TUN
             self.readPackets()
 
             completionHandler(nil)
