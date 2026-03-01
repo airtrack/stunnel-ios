@@ -42,5 +42,5 @@ targets:
       PRODUCT_BUNDLE_IDENTIFIER: me.airtrack.stunnel.PacketTunnel
       SWIFT_OBJC_BRIDGING_HEADER: Shared/RustBridge.h
       LIBRARY_SEARCH_PATHS: "$(inherited) $(SRCROOT)/../stunnel-core/target/aarch64-apple-ios-sim/$(CONFIGURATION:lower)"
-      OTHER_LDFLAGS: "$(inherited) -lrust_core -lresolv"
+      OTHER_LDFLAGS: "$(inherited) -lstunnel_core -lresolv"
       EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
