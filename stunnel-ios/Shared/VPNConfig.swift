@@ -4,18 +4,18 @@ struct VPNConfig: Codable {
     var mode: String
     var serverAddr: String
     var serverName: String
-    var cert: String // 证书内容
-    var privKey: String // 私钥内容
+    var cert: String // Certificate content
+    var privKey: String // Private key content
     
     static let sharedSuiteName = "group.me.airtrack.stunnel"
     static let configKey = "vpn_configuration"
     
-    // 获取共享容器的基础 URL
+    // Get the shared container base URL
     static var sharedContainerURL: URL? {
         return FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: sharedSuiteName)
     }
     
-    // 将内容保存为共享目录下的文件，并返回该文件的绝对路径
+    // Save content as a file in the shared directory and return its absolute path
     private func saveFile(name: String, content: String) -> String? {
         guard let containerURL = VPNConfig.sharedContainerURL else { return nil }
         let fileURL = containerURL.appendingPathComponent(name)
@@ -38,7 +38,7 @@ struct VPNConfig: Codable {
         return try? decoder.decode(VPNConfig.self, from: data)
     }
     
-    // 生成传给 Rust 的 JSON，此时需要将内容转为实际的沙盒路径
+    // Generate JSON for Rust, converting content to actual sandbox paths
     func toRustConfigJSON() -> String? {
         guard let certPath = saveFile(name: "client.crt", content: cert),
               let keyPath = saveFile(name: "client.key", content: privKey) else {
