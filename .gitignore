@@ -1,4 +1,20 @@
+# Rust
 rust-core/target/
-.DS_Store
-\nstunnel-ios/**/*.xcodeproj
+rust-core/Cargo.lock
+
+# Xcode
+stunnel-ios/stunnel-ios.xcodeproj/
+stunnel-ios/DerivedData/
 stunnel-ios/build/
+*.xcworkspace
+xcuserdata/
+DerivedData/
+build/
+
+# macOS
+.DS_Store
+
+# Misc
+*.swp
+*~
+.DS_Store
