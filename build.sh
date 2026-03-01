@@ -9,7 +9,7 @@ set -e
 PROJECT_NAME="stunnel-ios"
 RUST_CORE_DIR="rust-core"
 IOS_DIR="stunnel-ios"
-MODE="release"
+MODE="Release"
 CARGO_FLAG="--release"
 
 # Parse arguments
@@ -17,12 +17,12 @@ for arg in "$@"
 do
     case $arg in
         --debug)
-        MODE="debug"
+        MODE="Debug"
         CARGO_FLAG=""
         shift
         ;;
         --release)
-        MODE="release"
+        MODE="Release"
         CARGO_FLAG="--release"
         shift
         ;;
@@ -41,7 +41,6 @@ echo "  -> Target: aarch64-apple-ios-sim (Simulator)"
 cargo build --target aarch64-apple-ios-sim $CARGO_FLAG
 
 echo "  -> Target: aarch64-apple-ios (Device)"
-# Note: This may fail on some environments without full iOS SDK path configuration
 cargo build --target aarch64-apple-ios $CARGO_FLAG || echo "⚠️  Warning: Device build failed. Simulator build should still work."
 
 cd ..
@@ -52,19 +51,20 @@ cd $IOS_DIR
 xcodegen generate
 
 # 3. Build Xcode Project (Simulator)
-echo "🏗️  Building iOS App for Simulator..."
-# We use a generic destination to ensure it builds even if a specific simulator isn't booted
-xcodebuild build 
-    -scheme stunnel-ios 
-    -destination 'generic/platform=iOS Simulator' 
-    CODE_SIGNING_ALLOWED=YES 
-    CODE_SIGNING_REQUIRED=NO 
-    CODE_SIGN_IDENTITY="-" 
-    | xcbeautify || xcodebuild build 
-    -scheme stunnel-ios 
-    -destination 'generic/platform=iOS Simulator' 
-    CODE_SIGNING_ALLOWED=YES 
-    CODE_SIGN_REQUIRED=NO 
+echo "🏗️  Building iOS App for Simulator (Configuration: $MODE)..."
+xcodebuild build \
+    -scheme stunnel-ios \
+    -configuration $MODE \
+    -destination 'generic/platform=iOS Simulator' \
+    CODE_SIGNING_ALLOWED=YES \
+    CODE_SIGNING_REQUIRED=NO \
+    CODE_SIGN_IDENTITY="-" \
+    | xcbeautify || xcodebuild build \
+    -scheme stunnel-ios \
+    -configuration $MODE \
+    -destination 'generic/platform=iOS Simulator' \
+    CODE_SIGNING_ALLOWED=YES \
+    CODE_SIGNING_REQUIRED=NO \
     CODE_SIGN_IDENTITY="-"
 
 echo "------------------------------------------------"

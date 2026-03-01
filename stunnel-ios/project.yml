@@ -1,6 +1,6 @@
 name: stunnel-ios
 options:
-  bundleIdPrefix: com.airtrack.stunnel
+  bundleIdPrefix: me.airtrack.stunnel
   developmentLanguage: en
 
 targets:
@@ -8,7 +8,7 @@ targets:
     type: application
     platform: iOS
     deploymentTarget: "18.0"
-    bundleId: com.airtrack.stunnel
+    bundleId: me.airtrack.stunnel
     sources:
       - path: App
       - path: Shared
@@ -20,12 +20,15 @@ targets:
     settings:
       SWIFT_VERSION: 5.0
       CODE_SIGN_ENTITLEMENTS: stunnel-ios.entitlements
+      PRODUCT_BUNDLE_IDENTIFIER: me.airtrack.stunnel
+      # 排除 x86_64 架构，避免链接冲突
+      EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
 
   PacketTunnel:
     type: app-extension
     platform: iOS
     deploymentTarget: "18.0"
-    bundleId: com.airtrack.stunnel.PacketTunnel
+    bundleId: me.airtrack.stunnel.PacketTunnel
     sources:
       - path: PacketTunnel
       - path: Shared
@@ -37,6 +40,9 @@ targets:
     settings:
       SWIFT_VERSION: 5.0
       CODE_SIGN_ENTITLEMENTS: PacketTunnel.entitlements
+      PRODUCT_BUNDLE_IDENTIFIER: me.airtrack.stunnel.PacketTunnel
       SWIFT_OBJC_BRIDGING_HEADER: Shared/RustBridge.h
-      LIBRARY_SEARCH_PATHS: "$(inherited) $(SRCROOT)/../rust-core/target/aarch64-apple-ios-sim/release"
+      LIBRARY_SEARCH_PATHS: "$(inherited) $(SRCROOT)/../rust-core/target/aarch64-apple-ios-sim/$(CONFIGURATION:lower)"
       OTHER_LDFLAGS: "$(inherited) -lrust_core -lresolv"
+      # 排除 x86_64 架构
+      EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64

@@ -40,7 +40,7 @@ class VPNManager: ObservableObject {
                 print("stunnel-ios: No existing manager found, creating new one")
                 let newManager = NETunnelProviderManager()
                 let protocolConfiguration = NETunnelProviderProtocol()
-                protocolConfiguration.providerBundleIdentifier = "com.airtrack.stunnel.PacketTunnel"
+                protocolConfiguration.providerBundleIdentifier = "me.airtrack.stunnel.PacketTunnel"
                 newManager.protocolConfiguration = protocolConfiguration
                 newManager.localizedDescription = "stunnel-ios"
                 self.manager = newManager
@@ -63,7 +63,7 @@ class VPNManager: ObservableObject {
             }
             
             let protocolConfiguration = (manager.protocolConfiguration as? NETunnelProviderProtocol) ?? NETunnelProviderProtocol()
-            protocolConfiguration.providerBundleIdentifier = "com.airtrack.stunnel.PacketTunnel"
+            protocolConfiguration.providerBundleIdentifier = "me.airtrack.stunnel.PacketTunnel"
             protocolConfiguration.serverAddress = config.serverAddr
             
             manager.protocolConfiguration = protocolConfiguration

@@ -7,7 +7,7 @@ struct VPNConfig: Codable {
     var cert: String // 证书内容
     var privKey: String // 私钥内容
     
-    static let sharedSuiteName = "group.com.airtrack.stunnel"
+    static let sharedSuiteName = "group.me.airtrack.stunnel"
     static let configKey = "vpn_configuration"
     
     // 获取共享容器的基础 URL

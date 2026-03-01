@@ -8,7 +8,7 @@
 	</array>
 	<key>com.apple.security.application-groups</key>
 	<array>
-		<string>group.com.airtrack.stunnel</string>
+		<string>group.me.airtrack.stunnel</string>
 	</array>
 </dict>
 </plist>
