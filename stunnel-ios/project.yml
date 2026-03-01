@@ -20,30 +20,27 @@ targets:
     settings:
       SWIFT_VERSION: 5.0
       CODE_SIGN_ENTITLEMENTS: stunnel-ios.entitlements
-      # Exclude x86_64 architecture to avoid linker conflicts
+      PRODUCT_BUNDLE_IDENTIFIER: me.airtrack.stunnel
       EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
 
-      PacketTunnel:
-      type: app-extension
-      platform: iOS
-      deploymentTarget: "18.0"
-      bundleId: me.airtrack.stunnel.PacketTunnel
-      sources:
+  PacketTunnel:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "18.0"
+    bundleId: me.airtrack.stunnel.PacketTunnel
+    sources:
       - path: PacketTunnel
       - path: Shared
-      info:
+    info:
       path: PacketTunnel/Info.plist
-      dependencies:
+    dependencies:
       - sdk: NetworkExtension.framework
       - sdk: Security.framework
-      settings:
+    settings:
       SWIFT_VERSION: 5.0
       CODE_SIGN_ENTITLEMENTS: PacketTunnel.entitlements
       PRODUCT_BUNDLE_IDENTIFIER: me.airtrack.stunnel.PacketTunnel
       SWIFT_OBJC_BRIDGING_HEADER: Shared/RustBridge.h
-      # Dynamically adapt Debug/Release paths
-      LIBRARY_SEARCH_PATHS: "$(inherited) $(SRCROOT)/../rust-core/target/aarch64-apple-ios-sim/$(CONFIGURATION:lower)"
+      LIBRARY_SEARCH_PATHS: "$(inherited) $(SRCROOT)/../stunnel-core/target/aarch64-apple-ios-sim/$(CONFIGURATION:lower)"
       OTHER_LDFLAGS: "$(inherited) -lrust_core -lresolv"
-      # Exclude x86_64 architecture
       EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
-

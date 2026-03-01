@@ -1,6 +1,6 @@
 # Rust
-rust-core/target/
-rust-core/Cargo.lock
+stunnel-core/target/
+stunnel-core/Cargo.lock
 
 # Xcode
 stunnel-ios/stunnel-ios.xcodeproj/

@@ -7,7 +7,7 @@ set -e
 
 # --- Configuration ---
 PROJECT_NAME="stunnel-ios"
-RUST_CORE_DIR="rust-core"
+RUST_CORE_DIR="stunnel-core"
 IOS_DIR="stunnel-ios"
 MODE="Release"
 CARGO_FLAG="--release"

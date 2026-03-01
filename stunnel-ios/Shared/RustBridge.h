@@ -2,6 +2,6 @@
 #define RUST_BRIDGE_H
 
 #import <Foundation/Foundation.h>
-#import "../../rust-core/include/rust_core.h"
+#import "../../stunnel-core/include/rust_core.h"
 
 #endif
