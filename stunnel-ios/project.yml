@@ -1,6 +1,6 @@
 name: stunnel-ios
 options:
-  bundleIdPrefix: com.stunnel.ios
+  bundleIdPrefix: com.airtrack.stunnel
   developmentLanguage: en
 
 targets:
@@ -8,7 +8,7 @@ targets:
     type: application
     platform: iOS
     deploymentTarget: "18.0"
-    bundleId: com.stunnel.ios
+    bundleId: com.airtrack.stunnel
     sources:
       - path: App
       - path: Shared
@@ -18,14 +18,14 @@ targets:
       - target: PacketTunnel
         embed: true
     settings:
-      CODE_SIGN_ENTITLEMENTS: stunnel-ios.entitlements
       SWIFT_VERSION: 5.0
+      CODE_SIGN_ENTITLEMENTS: stunnel-ios.entitlements
 
   PacketTunnel:
     type: app-extension
     platform: iOS
     deploymentTarget: "18.0"
-    bundleId: com.stunnel.ios.PacketTunnel
+    bundleId: com.airtrack.stunnel.PacketTunnel
     sources:
       - path: PacketTunnel
       - path: Shared
@@ -35,8 +35,8 @@ targets:
       - sdk: NetworkExtension.framework
       - sdk: Security.framework
     settings:
-      CODE_SIGN_ENTITLEMENTS: PacketTunnel.entitlements
       SWIFT_VERSION: 5.0
+      CODE_SIGN_ENTITLEMENTS: PacketTunnel.entitlements
       SWIFT_OBJC_BRIDGING_HEADER: Shared/RustBridge.h
       LIBRARY_SEARCH_PATHS: "$(inherited) $(SRCROOT)/../rust-core/target/aarch64-apple-ios-sim/release"
       OTHER_LDFLAGS: "$(inherited) -lrust_core -lresolv"
