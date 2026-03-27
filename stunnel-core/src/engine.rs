@@ -1,16 +1,30 @@
+use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
+use std::task::Waker;
+
 use bytes::Bytes;
 use smoltcp::iface::{Config as SmolConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 use smoltcp::wire::{IpCidr, Ipv4Address};
-use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
-use std::task::Waker;
+
+const TUN_ADDR: Ipv4Address = Ipv4Address::new(192, 168, 1, 1);
+const TUN_PREFIX_LEN: u8 = 24;
+const TUN_MTU: usize = 1500;
 
 /// A simple buffer-backed device for smoltcp
 pub struct TunDevice {
     pub inbound_packets: VecDeque<Bytes>,
     pub outbound_callback: Option<extern "C" fn(*const u8, usize)>,
+}
+
+impl TunDevice {
+    fn new() -> Self {
+        Self {
+            inbound_packets: VecDeque::new(),
+            outbound_callback: None,
+        }
+    }
 }
 
 impl Device for TunDevice {
@@ -38,7 +52,7 @@ impl Device for TunDevice {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
-        caps.max_transmission_unit = 1500;
+        caps.max_transmission_unit = TUN_MTU;
         caps.checksum = ChecksumCapabilities::ignored();
         caps
     }
@@ -86,26 +100,22 @@ pub struct StunnelEngine {
 
 impl StunnelEngine {
     pub fn new() -> Self {
-        let mut device = TunDevice {
-            inbound_packets: VecDeque::new(),
-            outbound_callback: None,
-        };
-
+        let mut device = TunDevice::new();
         let config = SmolConfig::new(smoltcp::wire::HardwareAddress::Ip);
         let mut interface = Interface::new(config, &mut device, Instant::now());
 
         interface.update_ip_addrs(|addrs| {
             addrs
-                .push(IpCidr::new(Ipv4Address::new(192, 168, 1, 1).into(), 24))
+                .push(IpCidr::new(TUN_ADDR.into(), TUN_PREFIX_LEN))
                 .unwrap();
         });
 
         interface
             .routes_mut()
-            .add_default_ipv4_route(Ipv4Address::new(192, 168, 1, 1))
+            .add_default_ipv4_route(TUN_ADDR)
             .unwrap();
 
-        StunnelEngine {
+        Self {
             device,
             interface,
             sockets: SocketSet::new(vec![]),

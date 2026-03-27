@@ -5,12 +5,10 @@ pub mod tcp;
 pub mod udp;
 pub mod utils;
 
-use crate::config::AppConfig;
-use crate::connection::ConnectionManager;
-use crate::engine::StunnelEngine;
-use crate::tcp::{TcpStream, handle_tcp_direct_session, handle_tcp_proxy_session};
-use crate::udp::{UdpSocket, handle_udp_direct_session, handle_udp_proxy_session};
-use crate::utils::is_private_v4;
+use std::ffi::CStr;
+use std::net::SocketAddr;
+use std::os::raw::{c_char, c_void};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use smoltcp::socket::tcp::{Socket as SmolTcpSocket, SocketBuffer as TcpSocketBuffer};
@@ -18,13 +16,16 @@ use smoltcp::socket::udp::{
     PacketBuffer as UdpPacketBuffer, PacketMetadata as UdpPacketMetadata, Socket as SmolUdpSocket,
 };
 use smoltcp::wire::{IpProtocol, TcpPacket, UdpPacket};
-use std::ffi::CStr;
-use std::net::SocketAddr;
-use std::os::raw::{c_char, c_void};
-use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 use tracing::{Level, error, info};
 use tracing_subscriber;
+
+use crate::config::AppConfig;
+use crate::connection::ConnectionManager;
+use crate::engine::StunnelEngine;
+use crate::tcp::{TcpStream, handle_tcp_direct_session, handle_tcp_proxy_session};
+use crate::udp::{UdpSocket, handle_udp_direct_session, handle_udp_proxy_session};
+use crate::utils::is_private_v4;
 
 /// The main handle for the C interface.
 struct CoreContext {
@@ -33,6 +34,19 @@ struct CoreContext {
     config: AppConfig,
     conn_manager: Arc<ConnectionManager>,
 }
+
+impl CoreContext {
+    fn new(config: AppConfig) -> Self {
+        Self {
+            engine: Arc::new(Mutex::new(StunnelEngine::new())),
+            runtime: Runtime::new().unwrap(),
+            config,
+            conn_manager: Arc::new(ConnectionManager::new()),
+        }
+    }
+}
+
+type PacketCallback = extern "C" fn(*const u8, usize);
 
 #[unsafe(no_mangle)]
 pub extern "C" fn stunnel_init_logging() {
@@ -59,33 +73,30 @@ pub extern "C" fn stunnel_start(config_json_ptr: *const c_char) -> *mut c_void {
         }
     };
 
+    if let Err(error) = config.tunnel_mode() {
+        error!("Invalid config: {:?}", error);
+        return std::ptr::null_mut();
+    }
+
     info!(
         "Starting stunnel-ios core engine with mode: {}",
         config.mode
     );
 
-    let engine = Arc::new(Mutex::new(StunnelEngine::new()));
-    let runtime = Runtime::new().unwrap();
-    let conn_manager = Arc::new(ConnectionManager::new());
-
-    let ctx = Box::new(CoreContext {
-        engine,
-        runtime,
-        config,
-        conn_manager,
-    });
+    let ctx = Box::new(CoreContext::new(config));
     Box::into_raw(ctx) as *mut c_void
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn stunnel_stop(handle: *mut c_void) {
+pub extern "C" fn stunnel_set_packet_callback(handle: *mut c_void, callback: PacketCallback) {
     if handle.is_null() {
         return;
     }
-    info!("Stopping stunnel-ios core engine");
-    unsafe {
-        let _ = Box::from_raw(handle as *mut CoreContext);
-    }
+
+    let ctx = unsafe { &*(handle as *const CoreContext) };
+    let mut engine = ctx.engine.lock().unwrap();
+    engine.device.outbound_callback = Some(callback);
+    info!("Rust core: Packet callback registered");
 }
 
 #[unsafe(no_mangle)]
@@ -107,96 +118,16 @@ pub extern "C" fn stunnel_process_packet(handle: *mut c_void, packet: *const u8,
 
         match ip_packet.next_header() {
             IpProtocol::Tcp => {
-                if let Ok(tcp_packet) = TcpPacket::new_checked(ip_packet.payload()) {
-                    if tcp_packet.syn() && !tcp_packet.ack() {
-                        let dst_port = tcp_packet.dst_port();
-                        info!(
-                            "Intercepted TCP SYN to {}:{} (direct: {})",
-                            dst_addr, dst_port, is_direct
-                        );
-
-                        let tcp_rx_buffer = TcpSocketBuffer::new(vec![0; 65536]);
-                        let tcp_tx_buffer = TcpSocketBuffer::new(vec![0; 65536]);
-                        let mut socket = SmolTcpSocket::new(tcp_rx_buffer, tcp_tx_buffer);
-                        socket.listen((dst_addr, dst_port)).unwrap();
-                        let socket_handle = engine.sockets.add(socket);
-
-                        let mut stream = TcpStream::new(socket_handle, Arc::clone(&ctx.engine));
-                        let config = ctx.config.clone();
-                        let target = format!("{}:{}", dst_addr, dst_port);
-                        let conn_manager = Arc::clone(&ctx.conn_manager);
-
-                        ctx.runtime.spawn(async move {
-                            let result = if is_direct {
-                                handle_tcp_direct_session(&mut stream, &target).await
-                            } else {
-                                handle_tcp_proxy_session(
-                                    &mut stream,
-                                    &config,
-                                    &target,
-                                    &conn_manager,
-                                )
-                                .await
-                            };
-                            if let Err(e) = result {
-                                error!("TCP session failed for {}: {:?}", target, e);
-                            }
-                        });
-                    }
-                }
+                handle_tcp_packet(ctx, &mut engine, ip_packet.payload(), dst_addr, is_direct)
             }
-            IpProtocol::Udp => {
-                if let Ok(udp_packet) = UdpPacket::new_checked(ip_packet.payload()) {
-                    let src_port = udp_packet.src_port();
-                    let dst_port = udp_packet.dst_port();
-                    let src_endpoint =
-                        SocketAddr::new(std::net::IpAddr::V4(src_addr.into()), src_port);
-
-                    if !engine.udp_sessions.contains_key(&src_endpoint) {
-                        info!(
-                            "Intercepted new UDP session from {} (direct: {})",
-                            src_endpoint, is_direct
-                        );
-
-                        let udp_rx_buffer = UdpPacketBuffer::new(
-                            vec![UdpPacketMetadata::EMPTY; 16],
-                            vec![0; 65536],
-                        );
-                        let udp_tx_buffer = UdpPacketBuffer::new(
-                            vec![UdpPacketMetadata::EMPTY; 16],
-                            vec![0; 65536],
-                        );
-                        let mut socket = SmolUdpSocket::new(udp_rx_buffer, udp_tx_buffer);
-                        socket.bind((dst_addr, dst_port)).unwrap();
-                        let socket_handle = engine.sockets.add(socket);
-                        engine.udp_sessions.insert(src_endpoint, socket_handle);
-
-                        let proxy_socket = UdpSocket::new(socket_handle, Arc::clone(&ctx.engine));
-                        let config = ctx.config.clone();
-                        let conn_manager = Arc::clone(&ctx.conn_manager);
-                        let target_addr =
-                            SocketAddr::new(std::net::IpAddr::V4(dst_addr.into()), dst_port);
-
-                        ctx.runtime.spawn(async move {
-                            let result = if is_direct {
-                                handle_udp_direct_session(proxy_socket, src_endpoint, target_addr)
-                                    .await
-                            } else {
-                                handle_udp_proxy_session(
-                                    proxy_socket,
-                                    src_endpoint,
-                                    &config,
-                                    &conn_manager,
-                                )
-                                .await
-                            };
-                            if let Err(e) = result {
-                                error!("UDP session failed for {}: {:?}", src_endpoint, e);
-                            }
-                        });
-                    }
-                }
-            }
+            IpProtocol::Udp => handle_udp_packet(
+                ctx,
+                &mut engine,
+                ip_packet.payload(),
+                src_addr,
+                dst_addr,
+                is_direct,
+            ),
             _ => {}
         }
     }
@@ -205,16 +136,109 @@ pub extern "C" fn stunnel_process_packet(handle: *mut c_void, packet: *const u8,
     engine.poll();
 }
 
-type PacketCallback = extern "C" fn(*const u8, usize);
-
 #[unsafe(no_mangle)]
-pub extern "C" fn stunnel_set_packet_callback(handle: *mut c_void, callback: PacketCallback) {
+pub extern "C" fn stunnel_stop(handle: *mut c_void) {
     if handle.is_null() {
         return;
     }
+    info!("Stopping stunnel-ios core engine");
+    unsafe {
+        let _ = Box::from_raw(handle as *mut CoreContext);
+    }
+}
 
-    let ctx = unsafe { &*(handle as *const CoreContext) };
-    let mut engine = ctx.engine.lock().unwrap();
-    engine.device.outbound_callback = Some(callback);
-    info!("Rust core: Packet callback registered");
+fn handle_tcp_packet(
+    ctx: &CoreContext,
+    engine: &mut StunnelEngine,
+    payload: &[u8],
+    dst_addr: smoltcp::wire::Ipv4Address,
+    is_direct: bool,
+) {
+    let Ok(tcp_packet) = TcpPacket::new_checked(payload) else {
+        return;
+    };
+
+    if !tcp_packet.syn() || tcp_packet.ack() {
+        return;
+    }
+
+    let dst_port = tcp_packet.dst_port();
+    info!(
+        "Intercepted TCP SYN to {}:{} (direct: {})",
+        dst_addr, dst_port, is_direct
+    );
+
+    let tcp_rx_buffer = TcpSocketBuffer::new(vec![0; 65536]);
+    let tcp_tx_buffer = TcpSocketBuffer::new(vec![0; 65536]);
+    let mut socket = SmolTcpSocket::new(tcp_rx_buffer, tcp_tx_buffer);
+    socket.listen((dst_addr, dst_port)).unwrap();
+
+    let socket_handle = engine.sockets.add(socket);
+    let mut stream = TcpStream::new(socket_handle, Arc::clone(&ctx.engine));
+    let config = ctx.config.clone();
+    let target = format!("{}:{}", dst_addr, dst_port);
+    let conn_manager = Arc::clone(&ctx.conn_manager);
+
+    ctx.runtime.spawn(async move {
+        let result = if is_direct {
+            handle_tcp_direct_session(&mut stream, &target).await
+        } else {
+            handle_tcp_proxy_session(&mut stream, &config, &target, &conn_manager).await
+        };
+
+        if let Err(error) = result {
+            error!("TCP session failed for {}: {:?}", target, error);
+        }
+    });
+}
+
+fn handle_udp_packet(
+    ctx: &CoreContext,
+    engine: &mut StunnelEngine,
+    payload: &[u8],
+    src_addr: smoltcp::wire::Ipv4Address,
+    dst_addr: smoltcp::wire::Ipv4Address,
+    is_direct: bool,
+) {
+    let Ok(udp_packet) = UdpPacket::new_checked(payload) else {
+        return;
+    };
+
+    let src_port = udp_packet.src_port();
+    let dst_port = udp_packet.dst_port();
+    let src_endpoint = SocketAddr::new(std::net::IpAddr::V4(src_addr.into()), src_port);
+
+    if engine.udp_sessions.contains_key(&src_endpoint) {
+        return;
+    }
+
+    info!(
+        "Intercepted new UDP session from {} (direct: {})",
+        src_endpoint, is_direct
+    );
+
+    let udp_rx_buffer = UdpPacketBuffer::new(vec![UdpPacketMetadata::EMPTY; 16], vec![0; 65536]);
+    let udp_tx_buffer = UdpPacketBuffer::new(vec![UdpPacketMetadata::EMPTY; 16], vec![0; 65536]);
+    let mut socket = SmolUdpSocket::new(udp_rx_buffer, udp_tx_buffer);
+    socket.bind((dst_addr, dst_port)).unwrap();
+
+    let socket_handle = engine.sockets.add(socket);
+    engine.udp_sessions.insert(src_endpoint, socket_handle);
+
+    let proxy_socket = UdpSocket::new(socket_handle, Arc::clone(&ctx.engine));
+    let config = ctx.config.clone();
+    let conn_manager = Arc::clone(&ctx.conn_manager);
+    let target_addr = SocketAddr::new(std::net::IpAddr::V4(dst_addr.into()), dst_port);
+
+    ctx.runtime.spawn(async move {
+        let result = if is_direct {
+            handle_udp_direct_session(proxy_socket, src_endpoint, target_addr).await
+        } else {
+            handle_udp_proxy_session(proxy_socket, src_endpoint, &config, &conn_manager).await
+        };
+
+        if let Err(error) = result {
+            error!("UDP session failed for {}: {:?}", src_endpoint, error);
+        }
+    });
 }

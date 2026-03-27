@@ -1,8 +1,10 @@
-use crate::config::AppConfig;
 use std::io;
 use std::net::SocketAddr;
+
 use tokio::sync::{Mutex as TokioMutex, OnceCell};
 use tracing::info;
+
+use crate::config::AppConfig;
 
 pub trait ConnectionState {
     fn in_good_condition(&mut self) -> io::Result<()>;
@@ -11,7 +13,7 @@ pub trait ConnectionState {
 impl ConnectionState for s2n_quic::connection::Handle {
     fn in_good_condition(&mut self) -> io::Result<()> {
         self.keep_alive(true)
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionReset, e))
+            .map_err(|error| io::Error::new(io::ErrorKind::ConnectionReset, error))
     }
 }
 
@@ -72,15 +74,12 @@ impl ConnectionManager {
         let connect =
             s2n_quic::client::Connect::new(addr).with_server_name(config.server_name.as_str());
 
-        let mut conn = client.connect(connect).await.map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("QUIC connect error: {:?}", e))
-        })?;
-        conn.keep_alive(true).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("QUIC keep-alive error: {:?}", e),
-            )
-        })?;
+        let mut conn = client
+            .connect(connect)
+            .await
+            .map_err(|error| io::Error::other(format!("QUIC connect error: {:?}", error)))?;
+        conn.keep_alive(true)
+            .map_err(|error| io::Error::other(format!("QUIC keep-alive error: {:?}", error)))?;
 
         let handle = conn.handle();
         *lock = Some(handle.clone());
