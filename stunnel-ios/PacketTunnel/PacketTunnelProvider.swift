@@ -1,10 +1,34 @@
 import NetworkExtension
 import os.log
 
+private final class PacketFlowBridge {
+    weak var provider: PacketTunnelProvider?
+
+    init(provider: PacketTunnelProvider) {
+        self.provider = provider
+    }
+
+    func writePacket(_ packetPtr: UnsafePointer<UInt8>, length: Int) {
+        let data = Data(bytes: packetPtr, count: length)
+        provider?.packetFlow.writePackets([data], withProtocols: [NSNumber(value: AF_INET)])
+    }
+}
+
 class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private var rustHandle: UnsafeMutableRawPointer?
-    static var shared: PacketTunnelProvider?
+    private var packetBridgeContext: UnsafeMutableRawPointer?
+    private let runtimeCoordinator: PacketTunnelRuntimeCoordinator
+
+    override init() {
+        self.runtimeCoordinator = PacketTunnelRuntimeCoordinator()
+        super.init()
+    }
+
+    init(runtimeCoordinator: PacketTunnelRuntimeCoordinator) {
+        self.runtimeCoordinator = runtimeCoordinator
+        super.init()
+    }
 
     override func startTunnel(options: [String : NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         os_log(.info, "stunnel-ios: PacketTunnelProvider startTunnel initiated")
@@ -15,18 +39,22 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
         // 2. Load configuration from App Group
         os_log(.info, "stunnel-ios: Loading config from App Group...")
-        guard let config = VPNConfig.load() else {
-            os_log(.error, "stunnel-ios: CRITICAL - Failed to load VPNConfig from UserDefaults")
-            completionHandler(NSError(domain: "stunnel-ios", code: 1, userInfo: [NSLocalizedDescriptionKey: "Failed to load configuration"]))
+        let runtime: PacketTunnelRuntimeHandle
+        do {
+            installPacketBridge()
+            runtime = try runtimeCoordinator.makeRuntime(
+                packetContext: packetBridgeContext,
+                callback: packetFlowCallback
+            )
+        } catch {
+            releasePacketBridge()
+            os_log(.error, "stunnel-ios: CRITICAL - Failed to prepare runtime: %{public}@", error.localizedDescription)
+            completionHandler(error)
             return
         }
-        
-        guard let configJson = config.toStunnelConfigJSON() else {
-            os_log(.error, "stunnel-ios: CRITICAL - Failed to generate Stunnel config JSON (cert write error?)")
-            completionHandler(NSError(domain: "stunnel-ios", code: 2, userInfo: [NSLocalizedDescriptionKey: "Failed to write cert files"]))
-            return
-        }
-        
+        let config = runtime.config
+        self.rustHandle = runtime.handle
+
         os_log(.info, "stunnel-ios: Config loaded successfully for mode: %{public}@", config.mode)
 
         // 3. Configure the tunnel
@@ -48,26 +76,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             }
 
             os_log(.info, "stunnel-ios: Tunnel settings applied. Starting Stunnel core...")
-            PacketTunnelProvider.shared = self
-
-            // 4. Start the Stunnel core
-            self.rustHandle = stunnel_start(configJson)
-            
-            if self.rustHandle == nil {
-                os_log(.error, "stunnel-ios: CRITICAL - Stunnel core failed to start (stunnel_start returned nil)")
-                completionHandler(NSError(domain: "stunnel-ios", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to start Stunnel core"]))
-                return
-            }
-
-            // 5. Setup callback from core to Swift
-            let callback: @convention(c) (UnsafePointer<UInt8>?, Int) -> Void = { (packetPtr, len) in
-                guard let packetPtr = packetPtr else { return }
-                let data = Data(bytes: packetPtr, count: len)
-                PacketTunnelProvider.shared?.packetFlow.writePackets([data], withProtocols: [NSNumber(value: AF_INET)])
-            }
-            stunnel_set_packet_callback(self.rustHandle, callback)
-            os_log(.info, "stunnel-ios: Stunnel core packet callback registered")
-
             // 6. Start reading packets from TUN
             os_log(.info, "stunnel-ios: Starting packet read loop")
             self.readPackets()
@@ -78,13 +86,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         os_log(.info, "stunnel-ios: stopTunnel reason: %d", reason.rawValue)
-        
-        if let handle = rustHandle {
-            stunnel_stop(handle)
-            rustHandle = nil
-        }
-        
-        PacketTunnelProvider.shared = nil
+
+        stopCoreRuntime()
         completionHandler()
     }
 
@@ -103,4 +106,36 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             self.readPackets()
         }
     }
+
+    private func installPacketBridge() {
+        releasePacketBridge()
+
+        let bridge = PacketFlowBridge(provider: self)
+        packetBridgeContext = Unmanaged.passRetained(bridge).toOpaque()
+    }
+
+    private func releasePacketBridge() {
+        guard let packetBridgeContext else {
+            return
+        }
+
+        Unmanaged<PacketFlowBridge>.fromOpaque(packetBridgeContext).release()
+        self.packetBridgeContext = nil
+    }
+
+    private func stopCoreRuntime() {
+        runtimeCoordinator.stopRuntime(handle: rustHandle)
+        rustHandle = nil
+
+        releasePacketBridge()
+    }
+}
+
+private let packetFlowCallback: StunnelPacketCallback = { context, packetPtr, length in
+    guard let context, let packetPtr else {
+        return
+    }
+
+    let bridge = Unmanaged<PacketFlowBridge>.fromOpaque(context).takeUnretainedValue()
+    bridge.writePacket(packetPtr, length: length)
 }

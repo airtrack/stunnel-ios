@@ -8,6 +8,7 @@ pub mod utils;
 use std::ffi::CStr;
 use std::net::SocketAddr;
 use std::os::raw::{c_char, c_void};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -33,6 +34,7 @@ struct CoreContext {
     runtime: Runtime,
     config: AppConfig,
     conn_manager: Arc<ConnectionManager>,
+    started: AtomicBool,
 }
 
 impl CoreContext {
@@ -42,11 +44,12 @@ impl CoreContext {
             runtime: Runtime::new().unwrap(),
             config,
             conn_manager: Arc::new(ConnectionManager::new()),
+            started: AtomicBool::new(false),
         }
     }
 }
 
-type PacketCallback = extern "C" fn(*const u8, usize);
+type PacketCallback = extern "C" fn(*mut c_void, *const u8, usize);
 
 #[unsafe(no_mangle)]
 pub extern "C" fn stunnel_init_logging() {
@@ -57,7 +60,7 @@ pub extern "C" fn stunnel_init_logging() {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn stunnel_start(config_json_ptr: *const c_char) -> *mut c_void {
+pub extern "C" fn stunnel_create(config_json_ptr: *const c_char) -> *mut c_void {
     let config_json = unsafe {
         if config_json_ptr.is_null() {
             return std::ptr::null_mut();
@@ -79,7 +82,7 @@ pub extern "C" fn stunnel_start(config_json_ptr: *const c_char) -> *mut c_void {
     }
 
     info!(
-        "Starting stunnel-ios core engine with mode: {}",
+        "Creating stunnel-ios core engine with mode: {}",
         config.mode
     );
 
@@ -88,7 +91,29 @@ pub extern "C" fn stunnel_start(config_json_ptr: *const c_char) -> *mut c_void {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn stunnel_set_packet_callback(handle: *mut c_void, callback: PacketCallback) {
+pub extern "C" fn stunnel_start(handle: *mut c_void) -> bool {
+    if handle.is_null() {
+        return false;
+    }
+
+    let ctx = unsafe { &*(handle as *const CoreContext) };
+    let engine = ctx.engine.lock().unwrap();
+    if engine.device.outbound_callback.is_none() {
+        error!("Cannot start stunnel-ios core without a packet callback");
+        return false;
+    }
+
+    ctx.started.store(true, Ordering::Release);
+    info!("stunnel-ios core runtime started");
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stunnel_set_packet_callback(
+    handle: *mut c_void,
+    context: *mut c_void,
+    callback: PacketCallback,
+) {
     if handle.is_null() {
         return;
     }
@@ -96,7 +121,21 @@ pub extern "C" fn stunnel_set_packet_callback(handle: *mut c_void, callback: Pac
     let ctx = unsafe { &*(handle as *const CoreContext) };
     let mut engine = ctx.engine.lock().unwrap();
     engine.device.outbound_callback = Some(callback);
+    engine.device.outbound_context = context as usize;
     info!("Rust core: Packet callback registered");
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stunnel_clear_packet_callback(handle: *mut c_void) {
+    if handle.is_null() {
+        return;
+    }
+
+    let ctx = unsafe { &*(handle as *const CoreContext) };
+    let mut engine = ctx.engine.lock().unwrap();
+    engine.device.outbound_callback = None;
+    engine.device.outbound_context = 0;
+    info!("Rust core: Packet callback cleared");
 }
 
 #[unsafe(no_mangle)]
@@ -106,6 +145,10 @@ pub extern "C" fn stunnel_process_packet(handle: *mut c_void, packet: *const u8,
     }
 
     let ctx = unsafe { &*(handle as *const CoreContext) };
+    if !ctx.started.load(Ordering::Acquire) {
+        return;
+    }
+
     let packet_data = unsafe { std::slice::from_raw_parts(packet, len) };
     let bytes = Bytes::copy_from_slice(packet_data);
 
@@ -132,7 +175,11 @@ pub extern "C" fn stunnel_process_packet(handle: *mut c_void, packet: *const u8,
         }
     }
 
-    engine.device.inbound_packets.push_back(bytes);
+    if !engine.push_inbound_packet(bytes) {
+        error!("Dropping inbound packet because the queue is full");
+        return;
+    }
+
     engine.poll();
 }
 
@@ -241,4 +288,96 @@ fn handle_udp_packet(
             error!("UDP session failed for {}: {:?}", src_endpoint, error);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::CString;
+    use std::os::raw::c_void;
+    use std::ptr;
+    use std::sync::atomic::Ordering;
+
+    use bytes::Bytes;
+
+    use super::{
+        CoreContext, stunnel_clear_packet_callback, stunnel_create, stunnel_process_packet,
+        stunnel_set_packet_callback, stunnel_start, stunnel_stop,
+    };
+
+    extern "C" fn noop_callback(_context: *mut c_void, _packet: *const u8, _len: usize) {}
+
+    fn valid_config_json() -> CString {
+        CString::new(
+            r#"{"mode":"s2n-quic","server_addr":"127.0.0.1:443","server_name":"localhost","cert":"client.crt","priv_key":"client.key"}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn create_rejects_invalid_json() {
+        let invalid = CString::new("{").unwrap();
+        let handle = stunnel_create(invalid.as_ptr());
+
+        assert!(handle.is_null());
+    }
+
+    #[test]
+    fn start_requires_callback_registration() {
+        let handle = stunnel_create(valid_config_json().as_ptr());
+        assert!(!handle.is_null());
+
+        assert!(!stunnel_start(handle));
+
+        unsafe {
+            let ctx = &*(handle as *const CoreContext);
+            assert!(!ctx.started.load(Ordering::Acquire));
+        }
+
+        stunnel_stop(handle);
+    }
+
+    #[test]
+    fn start_succeeds_after_callback_registration() {
+        let handle = stunnel_create(valid_config_json().as_ptr());
+        assert!(!handle.is_null());
+
+        stunnel_set_packet_callback(handle, ptr::null_mut(), noop_callback);
+        assert!(stunnel_start(handle));
+
+        unsafe {
+            let ctx = &*(handle as *const CoreContext);
+            assert!(ctx.started.load(Ordering::Acquire));
+        }
+
+        stunnel_clear_packet_callback(handle);
+        stunnel_stop(handle);
+    }
+
+    #[test]
+    fn create_rejects_unsupported_tunnel_mode() {
+        let invalid = CString::new(
+            r#"{"mode":"invalid","server_addr":"127.0.0.1:443","server_name":"localhost","cert":"client.crt","priv_key":"client.key"}"#,
+        )
+        .unwrap();
+        let handle = stunnel_create(invalid.as_ptr());
+
+        assert!(handle.is_null());
+    }
+
+    #[test]
+    fn process_packet_is_a_no_op_until_started() {
+        let handle = stunnel_create(valid_config_json().as_ptr());
+        assert!(!handle.is_null());
+
+        let packet = Bytes::from_static(&[0, 1, 2, 3]);
+        stunnel_process_packet(handle, packet.as_ptr(), packet.len());
+
+        unsafe {
+            let ctx = &*(handle as *const CoreContext);
+            let engine = ctx.engine.lock().unwrap();
+            assert!(engine.device.inbound_packets.is_empty());
+        }
+
+        stunnel_stop(handle);
+    }
 }

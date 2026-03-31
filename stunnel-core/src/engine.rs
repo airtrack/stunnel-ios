@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::os::raw::c_void;
 use std::task::Waker;
 
 use bytes::Bytes;
@@ -11,11 +12,13 @@ use smoltcp::wire::{IpCidr, Ipv4Address};
 const TUN_ADDR: Ipv4Address = Ipv4Address::new(192, 168, 1, 1);
 const TUN_PREFIX_LEN: u8 = 24;
 const TUN_MTU: usize = 1500;
+const MAX_INBOUND_PACKETS: usize = 1024;
 
 /// A simple buffer-backed device for smoltcp
 pub struct TunDevice {
     pub inbound_packets: VecDeque<Bytes>,
-    pub outbound_callback: Option<extern "C" fn(*const u8, usize)>,
+    pub outbound_callback: Option<extern "C" fn(*mut c_void, *const u8, usize)>,
+    pub outbound_context: usize,
 }
 
 impl TunDevice {
@@ -23,6 +26,7 @@ impl TunDevice {
         Self {
             inbound_packets: VecDeque::new(),
             outbound_callback: None,
+            outbound_context: 0,
         }
     }
 }
@@ -83,7 +87,11 @@ impl<'a> smoltcp::phy::TxToken for TxToken<'a> {
         let mut buffer = vec![0u8; len];
         let result = f(&mut buffer);
         if let Some(callback) = self.device.outbound_callback {
-            callback(buffer.as_ptr(), buffer.len());
+            callback(
+                self.device.outbound_context as *mut c_void,
+                buffer.as_ptr(),
+                buffer.len(),
+            );
         }
         result
     }
@@ -137,5 +145,33 @@ impl StunnelEngine {
 
     pub fn register_waker(&mut self, handle: SocketHandle, waker: Waker) {
         self.wakers.insert(handle, waker);
+    }
+
+    pub fn push_inbound_packet(&mut self, packet: Bytes) -> bool {
+        if self.device.inbound_packets.len() >= MAX_INBOUND_PACKETS {
+            return false;
+        }
+
+        self.device.inbound_packets.push_back(packet);
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_INBOUND_PACKETS, StunnelEngine};
+
+    use bytes::Bytes;
+
+    #[test]
+    fn inbound_queue_has_a_hard_cap() {
+        let mut engine = StunnelEngine::new();
+
+        for _ in 0..MAX_INBOUND_PACKETS {
+            assert!(engine.push_inbound_packet(Bytes::from_static(&[1, 2, 3, 4])));
+        }
+
+        assert!(!engine.push_inbound_packet(Bytes::from_static(&[9, 9, 9, 9])));
+        assert_eq!(engine.device.inbound_packets.len(), MAX_INBOUND_PACKETS);
     }
 }

@@ -1,5 +1,6 @@
 import SwiftUI
 import NetworkExtension
+import Combine
 
 struct ContentView: View {
     @StateObject private var vpnManager = VPNManager.shared
@@ -73,13 +74,22 @@ struct ContentView: View {
                 Alert(title: Text("Error"), message: Text(errorMessage ?? "Unknown error"), dismissButton: .default(Text("OK")))
             }
             .onAppear {
-                if let config = VPNConfig.load() {
-                    self.mode = config.mode
-                    self.serverAddr = config.serverAddr
-                    self.serverName = config.serverName
-                    self.cert = config.cert
-                    self.privKey = config.privKey
+                do {
+                    if let config = try VPNConfig.load() {
+                        self.mode = config.mode
+                        self.serverAddr = config.serverAddr
+                        self.serverName = config.serverName
+                        self.cert = config.cert
+                        self.privKey = config.privKey
+                    }
+                } catch {
+                    self.errorMessage = error.localizedDescription
+                    self.showError = true
                 }
+            }
+            .onReceive(vpnManager.$lastErrorMessage.compactMap { $0 }) { message in
+                self.errorMessage = message
+                self.showError = true
             }
         }
     }
