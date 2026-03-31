@@ -36,8 +36,8 @@ final class VPNConfigTests: XCTestCase {
         let certPath = try XCTUnwrap(payload["cert"])
         let keyPath = try XCTUnwrap(payload["priv_key"])
 
-        XCTAssertEqual(try String(contentsOfFile: certPath), config.cert)
-        XCTAssertEqual(try String(contentsOfFile: keyPath), config.privKey)
+        XCTAssertEqual(try String(contentsOfFile: certPath, encoding: .utf8), config.cert)
+        XCTAssertEqual(try String(contentsOfFile: keyPath, encoding: .utf8), config.privKey)
         XCTAssertEqual(payload["mode"], config.mode)
         XCTAssertEqual(payload["server_addr"], config.serverAddr)
         XCTAssertEqual(payload["server_name"], config.serverName)

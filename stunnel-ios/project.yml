@@ -3,6 +3,18 @@ options:
   bundleIdPrefix: me.airtrack.stunnel
   developmentLanguage: en
 
+schemes:
+  stunnel-ios:
+    build:
+      targets:
+        stunnel-ios: all
+        PacketTunnel: [build]
+    test:
+      gatherCoverageData: true
+      targets:
+        - name: stunnel-iosTests
+        - name: PacketTunnelTests
+
 targets:
   stunnel-ios:
     type: application
@@ -21,11 +33,12 @@ targets:
       - target: PacketTunnel
         embed: true
     settings:
-      SWIFT_VERSION: 5.0
-      CODE_SIGN_ENTITLEMENTS: stunnel-ios.entitlements
-      PRODUCT_BUNDLE_IDENTIFIER: me.airtrack.stunnel
-      ENABLE_APP_INTENTS_METADATA_GENERATION: NO
-      EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
+      base:
+        SWIFT_VERSION: 5.0
+        CODE_SIGN_ENTITLEMENTS: App/stunnel-ios.entitlements
+        PRODUCT_BUNDLE_IDENTIFIER: me.airtrack.stunnel
+        ENABLE_APP_INTENTS_METADATA_GENERATION: NO
+        EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
 
   PacketTunnel:
     type: app-extension
@@ -37,19 +50,24 @@ targets:
       - path: Shared
     info:
       path: PacketTunnel/Info.plist
+      properties:
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).PacketTunnelProvider
     dependencies:
       - sdk: AppIntents.framework
       - sdk: NetworkExtension.framework
       - sdk: Security.framework
     settings:
-      SWIFT_VERSION: 5.0
-      CODE_SIGN_ENTITLEMENTS: PacketTunnel.entitlements
-      PRODUCT_BUNDLE_IDENTIFIER: me.airtrack.stunnel.PacketTunnel
-      ENABLE_APP_INTENTS_METADATA_GENERATION: NO
-      SWIFT_OBJC_BRIDGING_HEADER: Shared/StunnelBridge.h
-      LIBRARY_SEARCH_PATHS: "$(inherited) $(SRCROOT)/../stunnel-core/target/aarch64-apple-ios-sim/$(CONFIGURATION:lower)"
-      OTHER_LDFLAGS: "$(inherited) -lstunnel_core -lresolv"
-      EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
+      base:
+        SWIFT_VERSION: 5.0
+        CODE_SIGN_ENTITLEMENTS: PacketTunnel/PacketTunnel.entitlements
+        PRODUCT_BUNDLE_IDENTIFIER: me.airtrack.stunnel.PacketTunnel
+        ENABLE_APP_INTENTS_METADATA_GENERATION: NO
+        SWIFT_OBJC_BRIDGING_HEADER: Shared/StunnelBridge.h
+        LIBRARY_SEARCH_PATHS: "$(inherited) $(SRCROOT)/../stunnel-core/target/aarch64-apple-ios-sim/$(CONFIGURATION:lower)"
+        OTHER_LDFLAGS: "$(inherited) -lstunnel_core -lresolv"
+        EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
 
   stunnel-iosTests:
     type: bundle.unit-test
@@ -57,12 +75,35 @@ targets:
     deploymentTarget: "18.0"
     sources:
       - path: Tests
-      - path: Shared/PacketTunnelRuntimeCoordinator.swift
+        excludes:
+          - PacketTunnelRuntimeCoordinatorTests.swift
     dependencies:
       - target: stunnel-ios
     settings:
-      SWIFT_VERSION: 5.0
-      PRODUCT_BUNDLE_IDENTIFIER: me.airtrack.stunnel.tests
-      TEST_HOST: "$(BUILT_PRODUCTS_DIR)/stunnel-ios.app/stunnel-ios"
-      BUNDLE_LOADER: "$(TEST_HOST)"
-      EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
+      base:
+        SWIFT_VERSION: 5.0
+        PRODUCT_BUNDLE_IDENTIFIER: me.airtrack.stunnel.tests
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/stunnel-ios.app/stunnel-ios"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
+
+  PacketTunnelTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: Tests/PacketTunnelRuntimeCoordinatorTests.swift
+      - path: Shared/PacketTunnelRuntimeCoordinator.swift
+      - path: Shared/VPNConfig.swift
+    dependencies:
+      - target: stunnel-ios
+    settings:
+      base:
+        SWIFT_VERSION: 5.0
+        PRODUCT_BUNDLE_IDENTIFIER: me.airtrack.stunnel.packettunnel-tests
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/stunnel-ios.app/stunnel-ios"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        SWIFT_OBJC_BRIDGING_HEADER: Shared/StunnelBridge.h
+        LIBRARY_SEARCH_PATHS: "$(inherited) $(SRCROOT)/../stunnel-core/target/aarch64-apple-ios-sim/$(CONFIGURATION:lower)"
+        OTHER_LDFLAGS: "$(inherited) -lstunnel_core -lresolv"
+        EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64

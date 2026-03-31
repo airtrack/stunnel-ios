@@ -1,5 +1,4 @@
 import XCTest
-@testable import stunnel_ios
 
 final class PacketTunnelRuntimeCoordinatorTests: XCTestCase {
     func testMakeRuntimeLoadsConfigAndStartsCore() throws {
